@@ -1,0 +1,5091 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Tempolux Studio 1.3 RC</title>
+<!--
+
+Tempolux to projekt trwający od początku świata, od 35 lat, i od roku.
+Ta aplikacja powstawała od 16tego lutego 2026 00:59 do 23ego lutego 2026 23:50, jak piszę te słowa.
+Ta aplikacja służy do rysowania światłem.
+Algorytmy starożytne powiązane przeze mnie i wszystkich dookoła.
+Kod pisany przez AI.
+AI kierowane przeze mnie.
+Ja kierowane przez AI i świat.
+Rafał Borkowski - Wójcik,
+Amanda
+Pumeks
+Rudy
+pozdrawiamy Rodziców
+
+Jestem zmęczony.
+
+Ten kod jest OPEN-SOURCE NA MOCY NADANEJ MI PRZEZ BOGÓW.
+Tu są operacje logiczne na ciągach binarnych, ja się tego uczułem jak byłem w podstawówce.
+Shaderów na GPU i tak nie rozumiem, ale jak się okazuje pasują do Tempoluxa jako systemu. Ha.
+Światło i czas.
+
+════════
+
+TEMPOLUX STUDIO — single-file build (open-source)
+Version: 1.3
+Authoring: Rafał Borkowski‑Wójcik + Amanda + (AI-assisted)
+Purpose: rysowanie światłem / generatywna „katedra” na GPU (WebGPU).
+
+QUICK START (keyboard-first)
+- ↑ ↓ : wybór rowa
+- ← → : zmiana wartości (tam gdzie lista/liczba)
+- Enter/Click : akcja / wejście
+- Esc : cofka (wyjście z layer / menu)
+- H : help overlay
+- Y : SAVE HISTORY (ON/OFF) — OFF = tylko manualne snapshoty usera
+- R : Rafał randomize (respektuje LOCK w rowach)
+- LMB click/drag : przesuń aktywną warstwę (focus = ecs.listCursor)
+- Shift podczas LMB drag : SNAP do siatki (SNAP_STEP w kodzie)
+
+WARSTWY (ECS, max MAX_CH slotów)
+- TPX (Tempolux)  : emitter / draw layer / światło / grawiton
+
+GRANICE (LIMITS)
+- Każdy TPX ma wbudowaną granicę: iShape + iLtype + iLimitA.
+- iShape: 0=off, 1=circle, N>=3=regular N-gon.
+- iLtype: 0=off, 1=wall(reflect), 2=hole(teleport-to-center).
+- Inwestygacja rysuje N-gon z offsetem π/N, aby 1:1 pasował do compute.
+
+LOCK RAFAŁA
+- Parametry oznaczone lockiem (L) są pomijane przez rafałową randomizację.
+- Lock jest per-node i per-prop (np. TPX.angle, TPX.iLimitA, itd.).
+
+TEMPOLUX STUDIO — DOKUMENTACJA KODU
+═══════════════════════════════════════════════════════════════════════
+
+ARCHITEKTURA UI — "LISTA + KONTEKST"
+──────────────────────────────────────
+Każdy widok budowany jest z płaskich wierszy (Row[]).
+Cały UI przechodzi przez jeden pipeline:
+
+  TLX_REGISTRY                   // rejestr parametrów / grup / widoków
+    params[id]                   // definicja parametru (core + presentation + behavior)
+    groups[id]                   // buildRows(ctx) → Row[]
+    views[id]                    // lista groupId w kolejności
+  buildList(ecs.ui.stack)        // context stack → flat[], groups[]
+  performRenderUI()              // flat[] → HTML + state.uiFlat
+  handleRow(row, dir, force)     // jeden punkt wejścia dla akcji/nawigacji
+
+CONTEXT STACK (ecs.ui.stack):
+  root              → widok STUDIO   (scene params + lista warstw)
+  schowane          → widok SCHOWANE  (tylko H: HOWAJ; push/pop przez ACTIONS.hud)
+  ustawienia        → widok USTAWIENIA SYSTEMU   (GPU / logikofizyka)
+  eksporty          → widok EKSPORTY i importy   (lista 1–6)
+  export {act}      → widok sub-eksportu         (nagranie / klisza / …)
+  node {nodeIdx}    → widok TEMPOLUX noda         (inspektor parametrów)
+  gry               → widok GRY i zabawy          (placeholder)
+
+TYPY WIERSZY (Row):
+  nav       { key, label, ctx?, pop? }           → nawigacja (push/pop stack)
+  action    { key, label, act, value?, noLR? }   → jednorazowa akcja
+  toggle    { key, label, get, set }             → bool (TAK/NIE)
+  list      { key, label, get, set, opts[] }     → lista wartości (← →)
+  number    { key/key2, label, get, set, step, min?, max?, fmt? } → liczba
+  header    → statyczny wiersz statystyk (row--stat); value może być funkcją
+  (special) _isButton=true  → row--btn  (240px centered, klik na label = aktywuj)
+  (special) _isLayerRow=true → row--layer (miniatura + nazwa + ✻ + L)
+  (special) _isTitle=true   → tytuł widoku (żółty tekst, no-op klik)
+  (special) _domCls='cls'   → dołącza klasę CSS do diva wiersza (np. stat-currently)
+
+ROW ANATOMY (320px = 16×20px):
+  Standard: [key-zone 40][ekran 240][icon 20][lock 20]
+  Layer:    [zaślepka 20][miniatura 20][ekran 240][vis ✻ 20][rafał L 20]
+  Button:   [key 20][spacer 20][przycisk 240]  ← label wyśrodkowany
+
+KLUCZE W BADGE:
+  kb(text)  → mała obwódka, single char uppercase lub ESC/ENT/← alias
+  key2      → dwa kb obok siebie, klik -1 (lewy) / +1 (prawy)
+  key:      → single, force=true → aktywuje row (toggle/nav/action)
+
+REJESTR PARAMETRÓW (TLX_REGISTRY):
+  Każdy param zdefiniowany przez tlxRegParam({ core, presentation, behavior }):
+    core:         { id, scope, key, valueType, min?, max?, step?, read, write }
+    presentation: { label, group, order, hotkeys, baseWidget, options?, format? }
+    behavior:     { snapHistory, recompute, lockable, act? }
+
+  Scope → skąd idzie kontekst odczytu:
+    SCENE  → stan sceny (state.*)
+    SYSTEM → TLX_PHYS.*
+    NODE   → ecs.nodes[ni].props.*
+    EXPORT → state.exportCfg.*
+    UI     → state.*  (toggles HUD itp.)
+
+  Grupy params zdefiniowane w tlxRegisterCoreParams():
+    scene.memory   → saveHistory, showGrid
+    scene.physics  → amandaEnabled, amandaG, mouseGrav, entropyEnabled, entropyG, gravMode
+    scene.render   → accumulate, mirror, bgMode, ramaMode, fieldStr
+    system.gpu     → maxPtsPreset
+    system.logic   → pairDistUnitFrames, entropyPerSecond
+    (node params   → auto-mapowane z NODE_PROPS przez NODE_GROUP_META)
+
+  Grupy UI zdefiniowane w tlxRegisterUiArchitecture():
+    ui.schowane        → widok SCHOWANY — jeden przycisk H: HOWAJ (view: base.schowane)
+    ui.root.top        → Tempolux title + HOWAJ + toggles + SNAP + E/G nav
+    ui.root.nodes      → tpx count + lista warstw (layer rows)
+    ui.root.actions    → RAFAŁ inspiruje (global randomize)
+    ui.stat.camera     → number rows: zoom (−/=), x kamery (c/v), y kamery (f/b) — dolna grupa root
+    ui.stat.system     → header rows: limit, gpu, luxy, max (dolna grupa ustawienia)
+    ui.node.shell      → ESC nav + miniatura+name + P+L toggles + / przycisk PRZEŹWIJ
+    node.tpx.raf       → R button + params generatora (bits, seed, words, …)
+    node.tpx.mat       → drawMode, colMode, palSeed, blend, alpha, lod
+    node.tpx.pos       → x, y, head, iShape, iLtype, iLimitA
+    node.tpx.relations → lista relacji TPX (lista)
+    ui.ustawienia.shell → Ustawienia systemu shell
+    ui.eksporty        → lista 1–6 przycisków eksportu
+    ui.export.shell    → WRÓĆ + tytuł sub-eksportu
+    ui.export.current  → params sub-eksportu + EKSPORTUJ
+
+TPX PROPS (grupy):
+  [RAF]  bits, seed, words, steps, angle, twist, resetH, pulsar, gravStr   (klucze: 1/2 3 4/5 6/7 8/9 Q W E S/D)
+  [MAT]  drawMode, colMode, palSeed, blend, alpha, lod                      (klucze: R T K Y U/I [/])
+  [POS]  x, y, head, iShape, iLtype, iLimitA                                (klucze: auto / K/L)
+  [CONN] tpxRelations{}, tpxRelStrengths{}
+
+HISTORIA / SNAPSY:
+  history[]     = taśma snapów (max HISTORY_MAX=1991)
+  historyIdx    = bieżący wskaźnik
+  snapshot()    = pcha snap jeśli saveHistory ON lub wywołane manualnie
+  historyStep(d)= porusza wskaźnikiem i odtwarza snap
+
+EKSPORTY:
+  PNG              → bieżąca klatka canvasu
+  Klisza .png      → N klatek historii w siatce
+  Naświetlisza .png → N klatek lightweight blend
+  Film .webm       → historia zakres from..to, fps preset
+  Plik .tpx        → JSON; import czyta RAW sekcję
+
+NIEZMIENNIKI:
+  max MAX_CH TPX na scenę (guard w addNode)
+  clampWords() chroni GPU przed overflow MAX_PTS
+  rafalEnabled=false → randomizeAll() pomija node (R global); / PRZEŹWIJ zawsze działa
+═══════════════════════════════════════════════════════════════════════
+-->
+<style>
+/* ═══════════════════════════════════════════════════════════════════════
+ * TEMPOLUX STUDIO — CSS 2.0
+ * system 20 / 40 / 240 / 320
+ * bez zmian logiki JS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* grid */
+  --ui-unit: 20px;
+  --ui-cols: 16;
+  --ui-panel-w: calc(var(--ui-unit) * 16);  /* 320 */
+  --ui-slot-1: var(--ui-unit);              /* 20  */
+  --ui-slot-2: calc(var(--ui-unit) * 2);    /* 40  */
+  --ui-slot-6: calc(var(--ui-unit) * 6);    /* 120 */
+  --ui-slot-14: calc(var(--ui-unit) * 14);  /* 280 */
+  --ui-slot-12: calc(var(--ui-unit) * 12);  /* 240 */
+  --ui-row-grid: var(--ui-slot-2) var(--ui-slot-6) var(--ui-slot-6) var(--ui-slot-2);
+  --ui-row-h: var(--ui-unit);
+  --ui-radius: 0px;
+  --ui-radius-lg: 0px;
+
+  /* font */
+  --font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-size: 13px;
+  --font-size-sm: 12px;
+  --font-size-xs: 10px;
+
+  /* base colors */
+  --bg: #050505;
+  --bg-panel: rgba(0,0,0,0.80);
+  --bg-row: transparent;
+  --bg-row-hover: rgba(255,255,255,0.10);
+  --bg-row-active: #000;
+  --bg-title: #141414;
+
+  --border: #181818;
+  --border-dim: #222;
+  --border-kb: rgba(255,255,255,0.16);
+  --border-active: rgba(255,255,255,1);
+  --border-active-soft: rgba(255,255,255,0.35);
+
+  --txt-ghost: #222;
+  --txt-dim: #444;
+  --txt-mute: #555;
+  --txt-low: #666;
+  --txt-mid: #777;
+  --txt-base: #999;
+  --txt-med: #bbb;
+  --txt-high: #ddd;
+  --txt-on: #fff;
+
+  --txt-row-label: rgba(255,255,255,0.60);
+  --txt-row-value: rgba(255,255,255,0.45);
+  --txt-row-value-hl: rgba(255,255,255,0.80);
+
+  /* category */
+  --col-info:   #4a9eff;
+  --col-export: #ff7c38;
+  --col-random: #00d4c8;
+  --col-tpx:    #ef4444;
+  --col-warn:   #f59e0b;
+
+  /* state-driven row tokens */
+  --row-bg: var(--bg-row);
+  --row-outline: transparent;
+  --row-label-col: var(--txt-row-label);
+  --row-value-col: var(--txt-row-value);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: rgb(255, 211, 0);
+  --row-kb-border: var(--border-kb);
+}
+
+/* ── reset ───────────────────────────────────────────────────────────── */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+  font-family: var(--font);
+}
+
+canvas {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  cursor: crosshair;
+}
+
+/* ── hud shell ───────────────────────────────────────────────────────── */
+.hud {
+  position: fixed;
+  left: 10px;
+  top: 10px;
+  display: grid;
+  padding: 10px;
+  grid-template-columns: var(--ui-panel-w);
+  width: calc(var(--ui-panel-w) + 0px);
+  max-height: calc(100vh - 24px);
+  overflow: hidden;
+  border-radius: var(--ui-radius-lg);
+  font-size: var(--font-size);
+  line-height: 1.4;
+  user-select: none;
+  pointer-events: auto;
+  backdrop-filter: grayscale(1) blur(4px) brightness(0.4);
+}
+
+.hud.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ── layout ──────────────────────────────────────────────────────────── */
+.col {
+  display: grid;
+  grid-template-columns: var(--ui-panel-w);
+  width: var(--ui-panel-w);
+  gap: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.col--single {
+  width: var(--ui-panel-w);
+}
+
+.col-scroll {
+  display: grid;
+  align-content: start;
+  width: var(--ui-panel-w);
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.group {
+  display: grid;
+  grid-auto-rows: var(--ui-row-h);
+  padding-bottom: 0px;
+}
+
+/* ── generic row component ───────────────────────────────────────────── */
+.row,
+.ph {
+  --row-bg: var(--bg-row);
+  --row-outline: transparent;
+  --row-label-col: var(--txt-row-label);
+  --row-value-col: var(--txt-row-value);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: rgba(255,255,255,0.70);
+  --row-kb-border: var(--border-kb);
+
+  display: grid;
+  grid-template-columns: var(--ui-row-grid);
+  align-items: center;
+  width: var(--ui-panel-w);
+  min-width: var(--ui-panel-w);
+  height: var(--ui-row-h);
+  min-height: var(--ui-row-h);
+  padding: 0;
+  cursor: default;
+  background: var(--row-bg);
+  outline: 1px solid var(--row-outline);
+  outline-offset: -1px;
+  box-sizing: border-box;
+}
+
+/* optional: keep shell crisp, no blur */
+.row {
+  border-radius: var(--ui-radius-lg);
+}
+
+.row:hover:not(.row--active):not(.row--muted):not(.row--title) {
+  --row-bg: var(--bg-row-hover);
+}
+
+.row--active,
+.ph--active {
+  --row-bg: var(--bg-row-active);
+  --row-outline: var(--border-active);
+  --row-label-col: rgba(255,255,255,0.92);
+  --row-value-col: rgba(255,255,255,0.80);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: rgba(255,255,255,0.92);
+  --row-kb-border: rgba(255,255,255,0.55);
+}
+
+.row--muted {
+  opacity: 0.28;
+}
+
+/* ── row anatomy ─────────────────────────────────────────────────────── */
+.row-keys {
+  grid-column: 1;
+  height: var(--ui-row-h);
+  display: grid;
+  grid-template-columns: repeat(2, var(--ui-slot-1));
+  align-items: center;
+  justify-items: center;
+  gap: 0;
+  overflow: hidden;
+}
+
+.row-lbl {
+  grid-column: 2;
+  min-width: 0;
+  padding-left: 10px;
+  color: var(--row-label-col);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-sizing: border-box;
+}
+
+.row-val {
+  grid-column: 3;
+  min-width: 0;
+  width: auto;
+  padding-right: 10px;
+  color: var(--row-value-col);
+  text-align: right;
+  white-space: nowrap;
+  font-size: 1em;
+  box-sizing: border-box;
+}
+
+.row-val--hl {
+  color: var(--txt-row-value-hl);
+}
+
+.row-icon {
+  grid-column: 4;
+  width: auto;
+  min-width: 0;
+  height: var(--ui-row-h);
+  display: grid;
+  align-items: center;
+  justify-items: start;
+  padding: 0;
+  color: var(--row-icon-col);
+  text-align: center;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.row-lbl u {
+  text-underline-offset: 3px;
+  text-decoration-thickness: 2px;
+}
+
+/* ── title / panel-head rows ─────────────────────────────────────────── */
+.row--title,
+.ph {
+  background: var(--bg-title);
+  border-bottom: 1px solid var(--border);
+}
+
+.row--title:hover,
+.ph:hover:not(.ph--active) {
+  background: rgba(255,255,255,0.06);
+}
+
+.row--title .row-lbl,
+.ph .row-lbl {
+  color: #ffd84d;
+  padding-left: 4px;
+}
+
+.row--title .row-val,
+.ph .row-val {
+  color: var(--txt-row-value);
+}
+
+.row--title .row-icon,
+.ph .row-icon {
+  color: var(--txt-mid);
+}
+
+.ph--active {
+  --row-outline: var(--border-active-soft);
+  --row-label-col: var(--txt-base);
+  --row-value-col: var(--txt-row-value);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: var(--txt-base);
+  --row-kb-border: var(--border-kb);
+}
+
+/* ── key badges ──────────────────────────────────────────────────────── */
+.kb {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  width: var(--ui-slot-1);
+  min-width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  padding: 0;
+  box-sizing: border-box;
+  background: transparent;
+  color: rgba(255, 211, 0, 0.5);
+  line-height: 1;
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.00em;
+  border-radius: 2px;
+}
+
+.kb--tpx {
+  border-color: var(--border-dim);
+  color: var(--txt-base);
+  font-size: 9px;
+}
+
+.kb--wide {
+  width: var(--ui-slot-2);
+  min-width: var(--ui-slot-2);
+  height: var(--ui-slot-1);
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+
+  border: 1px solid var(--border-dim);
+  border-radius: var(--ui-radius);
+  color: rgb(255, 211, 0);
+  line-height: 1;
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+}
+
+.kb--char,
+.kb-char {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  width: var(--ui-slot-1);
+  min-width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  padding: 0;
+  box-sizing: border-box;
+
+  border: none;
+  background: transparent;
+  line-height: 1;
+  font-weight: 700;
+  font-size: var(--font-size-sm);
+}
+
+.kb--thumb,
+.thumb {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  box-sizing: border-box;
+  border: 0 solid var(--border-kb);
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+/* ── filler / placeholder slots ──────────────────────────────────────── */
+.zaslepka {
+  display: block;
+  width: 100%;
+  height: var(--ui-slot-1);
+  background: transparent;
+}
+
+/* ── lock badge ──────────────────────────────────────────────────────── */
+.lk {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  margin-left: 0;
+  user-select: none;
+  box-sizing: border-box;
+  color: rgba(0,0,0,0);
+  border-radius: var(--ui-radius);
+  font: var(--font-size-xs)/1 var(--font);
+}
+
+.lk--on {
+  color: var(--col-tpx);
+}
+
+/* ── row variants ────────────────────────────────────────────────────── */
+
+/* button row = 40 + 280 */
+.row--btn {
+  grid-template-columns: var(--ui-slot-2) var(--ui-slot-14);
+}
+
+.row--btn .row-keys {
+  grid-column: 1;
+}
+
+.row--btn .row-lbl {
+  grid-column: 2;
+  text-align: center;
+  color: var(--txt-base);
+  letter-spacing: 0.00em;
+  padding-left: 0;
+}
+
+.row--btn .row-val {
+  display: none;
+}
+
+.row--btn .row-icon {
+  display: none;
+}
+
+.row--btn.row--active .row-lbl {
+  color: var(--txt-on);
+}
+
+/* title row */
+.row--title {
+  cursor: default;
+}
+
+/* stat rows */
+.row--stat {
+  cursor: default;
+}
+
+.row--stat .row-lbl {
+  color: var(--txt-base);
+  padding-left: 4px;
+}
+
+.row--stat .row-val {
+  font-size: 1em;
+}
+
+.row--stat.warn .row-val {
+  color: var(--col-warn);
+}
+
+/* export entry */
+.row--export-entry .row-lbl {
+  color: var(--txt-base);
+  padding-left: 4px;
+}
+
+/* layer rows */
+.row--layer {
+  grid-template-columns: var(--ui-slot-2) var(--ui-slot-12) var(--ui-slot-2);
+}
+
+.row--layer .row-val {
+  display: none;
+}
+
+.row--layer .row-icon {
+  grid-column: 3;
+  display: grid;
+  grid-template-columns: repeat(2, var(--ui-slot-1));
+  align-items: center;
+  justify-items: center;
+  gap: 0;
+  padding: 0;
+}
+
+.vis-icon {
+  width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+/* helper modifiers for front zone */
+.row-keys--empty {
+  opacity: 0;
+}
+
+.row-keys--thumb,
+.row-keys--layer,
+.row-keys--double,
+.row-keys--single {
+  opacity: 1;
+}
+
+.row-keys .kb--wide {
+  grid-column: 1 / span 2;
+}
+
+/* separator */
+.row-sep {
+  display: block;
+  width: var(--ui-panel-w);
+  height: var(--ui-row-h);
+  opacity: 0;
+}
+
+/* ── scrollbar ───────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-dim);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--txt-mute);
+}
+</style><style>
+/* ═══════════════════════════════════════════════════════════════════════
+ * TEMPOLUX STUDIO — CSS 2.0
+ * system 20 / 40 / 240 / 320
+ * bez zmian logiki JS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* grid */
+  --ui-unit: 20px;
+  --ui-cols: 16;
+  --ui-panel-w: calc(var(--ui-unit) * 16);  /* 320 */
+  --ui-slot-1: var(--ui-unit);              /* 20  */
+  --ui-slot-2: calc(var(--ui-unit) * 2);    /* 40  */
+  --ui-slot-6: calc(var(--ui-unit) * 6);    /* 120 */
+  --ui-slot-14: calc(var(--ui-unit) * 14);  /* 280 */
+  --ui-slot-12: calc(var(--ui-unit) * 12);  /* 240 */
+  --ui-row-grid: var(--ui-slot-2) var(--ui-slot-6) var(--ui-slot-6) var(--ui-slot-2);
+  --ui-row-h: var(--ui-unit);
+  --ui-radius: 0px;
+  --ui-radius-lg: 0px;
+
+  /* font */
+  --font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-size: 13px;
+  --font-size-sm: 12px;
+  --font-size-xs: 10px;
+
+  /* base colors */
+  --bg: #050505;
+  --bg-panel: rgba(0,0,0,0.80);
+  --bg-row: transparent;
+  --bg-row-hover: rgba(255,255,255,0.10);
+  --bg-row-active: #000;
+  --bg-title: #141414;
+
+  --border: #181818;
+  --border-dim: #222;
+  --border-kb: rgba(255,255,255,0.16);
+  --border-active: rgba(255,255,255,1);
+  --border-active-soft: rgba(255,255,255,0.35);
+
+  --txt-ghost: #222;
+  --txt-dim: #444;
+  --txt-mute: #555;
+  --txt-low: #666;
+  --txt-mid: #777;
+  --txt-base: #999;
+  --txt-med: #bbb;
+  --txt-high: #ddd;
+  --txt-on: #fff;
+
+  --txt-row-label: rgba(255,255,255,0.60);
+  --txt-row-value: rgba(255,255,255,0.45);
+  --txt-row-value-hl: rgba(255,255,255,0.80);
+
+  /* category */
+  --col-info:   #4a9eff;
+  --col-export: #ff7c38;
+  --col-random: #00d4c8;
+  --col-tpx:    #ef4444;
+  --col-warn:   #f59e0b;
+
+  /* state-driven row tokens */
+  --row-bg: var(--bg-row);
+  --row-outline: transparent;
+  --row-label-col: var(--txt-row-label);
+  --row-value-col: var(--txt-row-value);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: rgb(255, 211, 0);
+  --row-kb-border: var(--border-kb);
+}
+
+/* ── reset ───────────────────────────────────────────────────────────── */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  overflow: hidden;
+  font-family: var(--font);
+}
+
+canvas {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  cursor: crosshair;
+}
+
+/* ── hud shell ───────────────────────────────────────────────────────── */
+.hud {
+  position: fixed;
+  left: 10px;
+  top: 10px;
+  display: grid;
+  padding: 10px;
+  grid-template-columns: var(--ui-panel-w);
+  width: calc(var(--ui-panel-w) + 0px);
+  max-height: calc(100vh - 24px);
+  overflow: hidden;
+  border-radius: var(--ui-radius-lg);
+  font-size: var(--font-size);
+  line-height: 1.4;
+  user-select: none;
+  pointer-events: auto;
+  backdrop-filter: grayscale(1) blur(4px) brightness(0.4);
+}
+
+.hud.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ── layout ──────────────────────────────────────────────────────────── */
+.col {
+  display: grid;
+  grid-template-columns: var(--ui-panel-w);
+  width: var(--ui-panel-w);
+  gap: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.col--single {
+  width: var(--ui-panel-w);
+}
+
+.col-scroll {
+  display: grid;
+  align-content: start;
+  width: var(--ui-panel-w);
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.group {
+  display: grid;
+  grid-auto-rows: var(--ui-row-h);
+  padding-bottom: 0px;
+}
+
+/* ── generic row component ───────────────────────────────────────────── */
+.row,
+.ph {
+  --row-bg: var(--bg-row);
+  --row-outline: transparent;
+  --row-label-col: var(--txt-row-label);
+  --row-value-col: var(--txt-row-value);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: rgba(255,255,255,0.70);
+  --row-kb-border: var(--border-kb);
+
+  display: grid;
+  grid-template-columns: var(--ui-row-grid);
+  align-items: center;
+  width: var(--ui-panel-w);
+  min-width: var(--ui-panel-w);
+  height: var(--ui-row-h);
+  min-height: var(--ui-row-h);
+  padding: 0;
+  cursor: default;
+  background: var(--row-bg);
+  outline: 1px solid var(--row-outline);
+  outline-offset: -1px;
+  box-sizing: border-box;
+}
+
+/* optional: keep shell crisp, no blur */
+.row {
+  border-radius: var(--ui-radius-lg);
+}
+
+.row:hover:not(.row--active):not(.row--muted):not(.row--title) {
+  --row-bg: var(--bg-row-hover);
+}
+
+.row--active,
+.ph--active {
+  --row-bg: var(--bg-row-active);
+  --row-outline: var(--border-active);
+  --row-label-col: rgba(255,255,255,0.92);
+  --row-value-col: rgba(255,255,255,0.80);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: rgba(255,255,255,0.92);
+  --row-kb-border: rgba(255,255,255,0.55);
+}
+
+.row--muted {
+  opacity: 0.28;
+}
+
+/* ── row anatomy ─────────────────────────────────────────────────────── */
+.row-keys {
+  grid-column: 1;
+  height: var(--ui-row-h);
+  display: grid;
+  grid-template-columns: repeat(2, var(--ui-slot-1));
+  align-items: center;
+  justify-items: center;
+  gap: 0;
+  overflow: hidden;
+}
+
+.row-lbl {
+  grid-column: 2;
+  min-width: 0;
+  padding-left: 10px;
+  color: var(--row-label-col);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-sizing: border-box;
+}
+
+.row-val {
+  grid-column: 3;
+  min-width: 0;
+  width: auto;
+  padding-right: 10px;
+  color: var(--row-value-col);
+  text-align: right;
+  white-space: nowrap;
+  font-size: 1em;
+  box-sizing: border-box;
+}
+
+.row-val--hl {
+  color: var(--txt-row-value-hl);
+}
+
+.row-icon {
+  grid-column: 4;
+  width: auto;
+  min-width: 0;
+  height: var(--ui-row-h);
+  display: grid;
+  align-items: center;
+  justify-items: start;
+  padding: 0;
+  color: var(--row-icon-col);
+  text-align: center;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.row-lbl u {
+  text-underline-offset: 3px;
+  text-decoration-thickness: 2px;
+}
+
+/* ── title / panel-head rows ─────────────────────────────────────────── */
+.row--title,
+.ph {
+  background: var(--bg-title);
+  border-bottom: 1px solid var(--border);
+}
+
+.row--title:hover,
+.ph:hover:not(.ph--active) {
+  background: rgba(255,255,255,0.06);
+}
+
+.row--title .row-lbl,
+.ph .row-lbl {
+  color: #ffd84d;
+  padding-left: 4px;
+}
+
+.row--title .row-val,
+.ph .row-val {
+  color: var(--txt-row-value);
+}
+
+.row--title .row-icon,
+.ph .row-icon {
+  color: var(--txt-mid);
+}
+
+.ph--active {
+  --row-outline: var(--border-active-soft);
+  --row-label-col: var(--txt-base);
+  --row-value-col: var(--txt-row-value);
+  --row-icon-col: var(--txt-mid);
+  --row-kb-col: var(--txt-base);
+  --row-kb-border: var(--border-kb);
+}
+
+/* ── key badges ──────────────────────────────────────────────────────── */
+.kb {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  width: var(--ui-slot-1);
+  min-width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  padding: 0;
+  box-sizing: border-box;
+  background: transparent;
+  color: rgba(255, 211, 0, 0.5);
+  line-height: 1;
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.00em;
+  border-radius: 2px;
+}
+
+.kb--tpx {
+  border-color: var(--border-dim);
+  color: var(--txt-base);
+  font-size: 9px;
+}
+
+.kb--wide {
+  width: var(--ui-slot-2);
+  min-width: var(--ui-slot-2);
+  height: var(--ui-slot-1);
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+
+  border: 1px solid var(--border-dim);
+  border-radius: var(--ui-radius);
+  color: rgb(255, 211, 0);
+  line-height: 1;
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+}
+
+.kb--char,
+.kb-char {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  width: var(--ui-slot-1);
+  min-width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  padding: 0;
+  box-sizing: border-box;
+
+  border: none;
+  background: transparent;
+  line-height: 1;
+  font-weight: 700;
+  font-size: var(--font-size-sm);
+}
+
+.kb--thumb,
+.thumb {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  box-sizing: border-box;
+  border: 0 solid var(--border-kb);
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+/* ── filler / placeholder slots ──────────────────────────────────────── */
+.zaslepka {
+  display: block;
+  width: 100%;
+  height: var(--ui-slot-1);
+  background: transparent;
+}
+
+/* ── lock badge ──────────────────────────────────────────────────────── */
+.lk {
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  margin-left: 0;
+  user-select: none;
+  box-sizing: border-box;
+  color: rgba(0,0,0,0);
+  border-radius: var(--ui-radius);
+  font: var(--font-size-xs)/1 var(--font);
+}
+
+.lk--on {
+  color: var(--col-tpx);
+}
+
+/* ── row variants ────────────────────────────────────────────────────── */
+
+/* button row = 40 + 280 */
+.row--btn {
+  grid-template-columns: var(--ui-slot-2) var(--ui-slot-14);
+}
+
+.row--btn .row-keys {
+  grid-column: 1;
+}
+
+.row--btn .row-lbl {
+  grid-column: 2;
+  text-align: center;
+  color: var(--txt-base);
+  letter-spacing: 0.00em;
+  padding-left: 0;
+}
+
+.row--btn .row-val {
+  display: none;
+}
+
+.row--btn .row-icon {
+  display: none;
+}
+
+.row--btn.row--active .row-lbl {
+  color: var(--txt-on);
+}
+
+/* title row */
+.row--title {
+  cursor: default;
+}
+
+/* stat rows */
+.row--stat {
+  cursor: default;
+}
+
+.row--stat .row-lbl {
+  color: var(--txt-base);
+  padding-left: 4px;
+}
+
+.row--stat .row-val {
+  font-size: 1em;
+}
+
+.row--stat.warn .row-val {
+  color: var(--col-warn);
+}
+
+/* export entry */
+.row--export-entry .row-lbl {
+  color: var(--txt-base);
+  padding-left: 4px;
+}
+
+/* layer rows */
+.row--layer {
+  grid-template-columns: var(--ui-slot-2) var(--ui-slot-12) var(--ui-slot-2);
+}
+
+.row--layer .row-val {
+  display: none;
+}
+
+.row--layer .row-icon {
+  grid-column: 3;
+  display: grid;
+  grid-template-columns: repeat(2, var(--ui-slot-1));
+  align-items: center;
+  justify-items: center;
+  gap: 0;
+  padding: 0;
+}
+
+.vis-icon {
+  width: var(--ui-slot-1);
+  height: var(--ui-slot-1);
+  display: grid;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+/* helper modifiers for front zone */
+.row-keys--empty {
+  opacity: 0;
+}
+
+.row-keys--thumb,
+.row-keys--layer,
+.row-keys--double,
+.row-keys--single {
+  opacity: 1;
+}
+
+.row-keys .kb--wide {
+  grid-column: 1 / span 2;
+}
+
+/* separator */
+.row-sep {
+  display: block;
+  width: var(--ui-panel-w);
+  height: var(--ui-row-h);
+  opacity: 0;
+}
+
+/* ── scrollbar ───────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-dim);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--txt-mute);
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="ov" style="position:fixed;top:0;left:0;width:100vw;height:100vh;pointer-events:none;"></canvas>
+<div class="hud" id="hud"></div>
+
+<script type="module">
+
+const canvas = document.getElementById("c");
+const hud    = document.getElementById("hud");
+const ov     = document.getElementById("ov");
+const ovCtx  = ov.getContext("2d");
+
+function resize() {
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  ov.width  = window.innerWidth;
+  ov.height = window.innerHeight;
+}
+resize();
+window.addEventListener("resize", resize);
+
+// ── WebGPU init ────────────────────────────────────────────────────────
+const adapter = await navigator.gpu.requestAdapter();
+const device  = await adapter.requestDevice({ requiredLimits: {
+  maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+  maxBufferSize: adapter.limits.maxBufferSize
+}});
+const context = canvas.getContext("webgpu");
+const format  = navigator.gpu.getPreferredCanvasFormat();
+context.configure({ device, format, alphaMode: "premultiplied", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+
+// ── Utils ──────────────────────────────────────────────────────────────
+function mulberry32(a) {
+  return function() {
+    let t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hslToRgb(h, s, l) {
+  const hue2rgb = (p, q, t) => {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1/6) return p + (q-p)*6*t; if (t < 1/2) return q;
+    if (t < 2/3) return p + (q-p)*(2/3-t)*6; return p;
+  };
+  let r, g, b;
+  if (s === 0) { r = g = b = l; }
+  else {
+    const q = l < 0.5 ? l*(1+s) : l+s-l*s, p = 2*l-q;
+    r = hue2rgb(p,q,h+1/3); g = hue2rgb(p,q,h); b = hue2rgb(p,q,h-1/3);
+  }
+  return [r, g, b];
+}
+function genPalColors(seed) {
+  const rnd = mulberry32(seed);
+  const h0 = rnd(), h1 = (h0+0.22+0.20*(rnd()-0.5)+1)%1, h2 = (h0+0.55+0.20*(rnd()-0.5)+1)%1;
+  const s = 0.65+0.25*rnd(), l0 = 0.45+0.15*rnd(), l1 = 0.55+0.15*rnd(), l2 = 0.50+0.20*rnd();
+  return {
+    palC: [1+rnd(),1+rnd(),1+rnd()], palD: [rnd(),rnd(),rnd()],
+    h0: hslToRgb(h0,s,l0), h1: hslToRgb(h1,s,l1), h2: hslToRgb(h2,s,l2)
+  };
+}
+
+// Stream base colors (LUT) — used for colMode "Hue" so each stream has a stable identity.
+// Values are in 0..1 RGB.
+const STREAM_HUE_LUT = [
+  [0.94, 0.20, 0.20], // red
+  [0.98, 0.55, 0.16], // orange
+  [0.95, 0.88, 0.20], // yellow
+  [0.25, 0.85, 0.35], // green
+  [0.20, 0.85, 0.92], // cyan
+  [0.28, 0.55, 0.98], // blue
+  [0.62, 0.35, 0.98], // purple
+  [0.95, 0.28, 0.78]  // magenta
+];
+function mix3(a, b, t) { return [a[0]*(1-t)+b[0]*t, a[1]*(1-t)+b[1]*t, a[2]*(1-t)+b[2]*t]; }
+function hueGradientFromBase(rgb) {
+  const dark = mix3(rgb, [0,0,0], 0.55);
+  const mid  = mix3(rgb, [1,1,1], 0.10);
+  const hi   = mix3(rgb, [1,1,1], 0.55);
+  return { h0: dark, h1: mid, h2: hi };
+}
+
+// ── TPX Machine (bit generator) ────────────────────────────────────────
+class TPXMachine {
+  constructor(seed) {
+    let r = mulberry32(seed);
+    this.L = [r()>0.5?1:0,r()>0.5?1:0,r()>0.5?1:0,r()>0.5?1:0];
+    this.G = [r()>0.5?1:0,r()>0.5?1:0];
+    this.B = []; this.localPos = 0; this.globalPos = 0;
+    this.localDir = 1; this.globalDir = 1; this.cap = 16;
+  }
+  step() {
+    if (this.globalPos >= this.G.length) this.globalPos = this.G.length - 1;
+    const res = this.L[this.localPos] ^ this.G[this.globalPos];
+    this.B.push(res);
+    const ones = this.B.reduce((a,b)=>a+b,0);
+    const isN = (ones === this.B.length - ones);
+    if (this.B.length >= this.cap) { if (isN) this.flush(); else this.B.length = 0; }
+    else if (isN && this.B.length > 0) this.flush();
+    this.localPos += this.localDir;
+    if (this.localPos >= this.L.length) { this.localPos = Math.max(0,this.L.length-2); this.localDir=-1; }
+    else if (this.localPos < 0) { this.localPos = Math.min(1,this.L.length-1); this.localDir=1; }
+    this.globalPos += this.globalDir;
+    if (this.globalPos >= this.G.length) { this.globalPos = Math.max(0,this.G.length-2); this.globalDir=-1; }
+    else if (this.globalPos < 0) { this.globalPos = Math.min(1,this.G.length-1); this.globalDir=1; }
+    return res;
+  }
+  flush() {
+    for (let b of this.B) this.G.push(b);
+    this.B.length = 0;
+    if (this.G.length > 200000) { this.G.splice(0,this.G.length-50000); this.globalPos = Math.min(this.globalPos,this.G.length-1); }
+  }
+}
+
+// PI generator — BBP formula gives hex digits of π; we emit each bit of each hex digit
+class PIGenerator {
+  constructor() { this._cache = PIGenerator._precompute(4096); this._pos = 0; }
+  static _precompute(nBits) {
+    // Use stored approximation: compute π via Machin series to enough precision
+    // We work in integer arithmetic scaled by 2^53
+    // Simpler: use known π bits via BPP mod-1 extraction for consecutive bits
+    // Even simpler for our purposes: use JS to compute enough digits and pack bits
+    const bits = [];
+    // π in binary via the standard: compute with sufficient BigInt precision
+    // Use 4*arctan(1) via Leibniz is too slow; use Machin: π/4 = 4*arctan(1/5) - arctan(1/239)
+    function arctan_series(x_inv, terms) {
+      // returns array of bits for arctan(1/x_inv) * 4 scaled to bigint
+      // We'll just use a Float64 array of bits pre-extracted
+    }
+    // Practical: use known π hex digits (first 2048) and unpack to bits
+    const PI_HEX = '243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89452821E638D01377BE5466CF34E90C6CC0AC29B7C97C50DD3F84D5B5B54709179216D5D98979FB1BD1310BA698DFB5AC2FFD72DBD01ADFB7B8E1AFED6A267E96BA7C9045F12C7F9924A19947B3916CF70801F2E2858EFC16636920D871574E69A458FEA3F4933D7E0D95748F728EB658718BCD5882154AEE7B54A41DC25A59B59C30D5392AF26013C5D1B023286085F0CA417918B8DB38EF8E79DCB0603A180E6C9E0E8BB01E8A3ED71577C1BD314B2778AF2FDA55605C60E65525F3AA55AB945748986263E8144055CA396A2AAB10B6B4CC5C341141E8CEA15486AF7C72E993B3EE1411636FBC2A2BA9C55D741831F6CE5C3E169B87931EAFD6BA336C274427651D239D66332EA92EB5AA4A4B23082630C90C29EDE1F7F57D4E19272D5159D6D21C00010EAD4F7F1B2F01054FC9F5660EEB7B9C16A000000';
+    for (let i = 0; i < PI_HEX.length && bits.length < nBits; i++) {
+      const nibble = parseInt(PI_HEX[i], 16);
+      for (let b = 3; b >= 0; b--) bits.push((nibble >> b) & 1);
+    }
+    return bits;
+  }
+  step() { return this._cache[this._pos++ % this._cache.length]; }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ECS DATA
+// ══════════════════════════════════════════════════════════════════════
+
+// ── User-configurable memory budget ───────────────────────────────────
+// Presets: 256k / 512k / 1M / 2M pts per channel
+// Changing this reinitializes the full GPU pipeline (shaders are recompiled).
+const PTS_PRESETS = [262144] //, 524288, 1048576, 2097152, 8388608];
+const PTS_LABELS  = ['256k', '512k', '1M', '2M', '8M'];
+let MAX_PTS = 1048576; // default 1M — safe for most machines
+const MAX_CH = 32;         // max channels (TPX nodes) — controls GPU slot arrays
+let GPU_INITIALIZED = false;
+
+// ── Eksport: stałe ────────────────────────────────────────────────────
+const KLISZA_N   = 64;      // ostatnich 64 klatek historii
+const KLISZA_OUT = 2048;    // 2048×2048 px, siatka 8×8
+const NASWIETLISZA_N = 64;  // ostatnich 64 klatek historii
+const NAGRANIE_FPS   = 24;  // klatkaż wideo
+const lists = {
+  hyper: ['Grid', 'Smear'],
+  grav:   ['Globalna', 'Lokalna'],
+  bits:   ['Rnd', 'Fibo', 'Meta', 'TPX', 'Zero', 'Jeden', 'Zebra', 'PI', 'Harm'],
+  draw:   ['Linie', 'Punkty', 'Plusy', '0/1'],
+  col:    ['Napięcie', 'Paleta', 'Szarość', 'Młotek', 'Zebra', 'Kwas', 'Kwant', 'Bit', 'BitInv', 'Hue', 'XYZ'],
+  blend:  ['Alfa', 'Add', 'Multiply', 'Screen', 'Min', 'Max'],
+  shape:  ['Brak', 'Koło', 'Linia', 'Trójkąt', 'Kwadrat', 'Pięciokąt', 'Sześciokąt', 'Siedmiokąt', 'Ośmiokąt', 'Dziewięciokąt', 'Dziesięciokąt', 'Jedenastokąt', 'Dwunastokąt'],
+  ltype:  ['Wolny', 'Ściana', 'Dziura'],
+  bg:     ['Czarne', 'Białe', 'Trans', 'Losowe'],
+  mirror: ['nie', 'X', 'XY', 'Kald'],
+  rama:   ['Wolny', 'Odbicie', 'Dziura'],
+  expFps:    ['12', '24', '30', '60'],
+  expFrames: ['16', '32', '64', '128'],
+  relType:['Naturalna', 'Przeciwna', 'Brak'],
+};
+
+const TLX_PHYS = {
+  simFps: 24,
+  pairDistUnit: 1,
+  pairDistUnitFrames: 24,
+  entropyPerSecond: 0.10,
+  localDistEps: 0.0025,
+  mouseDistEps: 0.01,
+  cadenceMinFrames: 1,
+  cadenceMaxFrames: 240,
+  moveDamping: 0.92,
+  maxVel: 2.5,
+  maxStep: 0.08,
+};
+
+const TLX_SCOPES = {
+  SYSTEM: 'system',
+  SCENE: 'scene',
+  NODE: 'node',
+  EXPORT: 'export',
+  UI: 'ui',
+};
+
+const TLX_RUNTIME_UI = {
+  activeViewId: 'base.rootScene',
+  mode: 'inspector',
+  dirtyLayout: true,
+  dirtyValues: new Set(),
+  dirtyGroups: new Set(),
+  dirtyViews: new Set(),
+  pending: false,
+  throttleMs: 33,
+  lastUiRenderMs: 0,
+};
+
+const TLX_REGISTRY = {
+  constants: { physics: TLX_PHYS },
+  params: {},
+  groups: {},
+  views: {},
+  widgetFamilies: {
+    'row-number': { id:'row-number', family:'base' },
+    'row-toggle': { id:'row-toggle', family:'base' },
+    'row-select': { id:'row-select', family:'base' },
+    'row-action': { id:'row-action', family:'base' },
+    'knob':       { id:'knob', family:'pro' },
+    'slider-v':   { id:'slider-v', family:'pro' },
+    'toggle':     { id:'toggle', family:'pro' },
+    'xy-pad':     { id:'xy-pad', family:'pro' },
+  },
+  proControllers: {
+    'gravity-knob':        { id:'gravity-knob', family:'knob',    config:{ bipolar:true, centerDetent:true, size:'m' } },
+    'angle-wheel':         { id:'angle-wheel',  family:'knob',    config:{ circular:true, wrap:true, unit:'deg' } },
+    'entropy-fader':       { id:'entropy-fader',family:'slider-v',config:{ glow:true } },
+    'mouse-gravity-fader': { id:'mouse-gravity-fader', family:'slider-v', config:{ bipolar:true } },
+    'save-history-toggle': { id:'save-history-toggle', family:'toggle', config:{} },
+  }
+};
+
+function tlxRegParam(def) {
+  TLX_REGISTRY.params[def.core.id] = def;
+  return def;
+}
+function tlxRegGroup(def) {
+  TLX_REGISTRY.groups[def.id] = def;
+  return def;
+}
+function tlxRegView(def) {
+  TLX_REGISTRY.views[def.id] = def;
+  return def;
+}
+function tlxParamCtx(overrides = {}) {
+  // Pass through any extra keys (e.g. exportAct) from overrides
+  const known = { scope:1, node:1, scene:1, system:1, ui:1, ecs:1, lists:1, registry:1 };
+  const extra = {};
+  for (const k of Object.keys(overrides)) { if (!known[k]) extra[k] = overrides[k]; }
+  return Object.assign({
+    scope: overrides.scope || TLX_SCOPES.SCENE,
+    node: overrides.node || null,
+    scene: state,
+    system: TLX_PHYS,
+    ui: TLX_RUNTIME_UI,
+    ecs,
+    lists,
+    registry: TLX_REGISTRY,
+  }, extra);
+}
+function tlxReadParam(paramId, ctx) {
+  const def = TLX_REGISTRY.params[paramId];
+  return def?.core?.read ? def.core.read(ctx) : undefined;
+}
+function tlxWriteParam(paramId, ctx, value) {
+  const def = TLX_REGISTRY.params[paramId];
+  if (!def?.core?.write) return;
+  def.core.write(ctx, value);
+}
+function tlxMarkUiDirty(kind = 'layout', id = null) {
+  if (kind === 'layout') TLX_RUNTIME_UI.dirtyLayout = true;
+  if (kind === 'value' && id) TLX_RUNTIME_UI.dirtyValues.add(id);
+  if (kind === 'group' && id) TLX_RUNTIME_UI.dirtyGroups.add(id);
+  if (kind === 'view'  && id) TLX_RUNTIME_UI.dirtyViews.add(id);
+}
+function tlxConsumeUiDirty() {
+  TLX_RUNTIME_UI.dirtyLayout = false;
+  TLX_RUNTIME_UI.dirtyValues.clear();
+  TLX_RUNTIME_UI.dirtyGroups.clear();
+  TLX_RUNTIME_UI.dirtyViews.clear();
+}
+
+// Pair-interaction invalidation:
+// Amanda / entropy / mouse gravity / relation UI all read from the same pair selector.
+// There is no heavy cached matrix here, but we still keep a dedicated dirty flag so that
+// any state change affecting pair logic gets normalized into one predictable refresh path.
+function tlxMarkPairPhysicsDirty(recompute = true) {
+  state.sim.tick = 0;
+  state.sim.accMs = 0;
+  state.sim.pairDirty = true;
+  state.sim.pairDirtyNeedsRecompute = !!recompute;
+  tlxMarkUiDirty('group', 'node.tpx.relations');
+}
+
+// Memory / limit presets
+const LIMIT_VALS   = [0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.00];
+const LIMIT_LABELS = LIMIT_VALS.map(v => v.toFixed(2));
+
+// Per-type badge letters & display IDs
+const TYPE_LETTER = { tpx:'T' };
+const TYPE_NAME   = { tpx:'Tempolux' };
+
+function getDisplayId(node) {
+  const idx = ecs.nodes.filter(n => n.type === node.type).indexOf(node) + 1;
+  return TYPE_LETTER[node.type] + idx;
+}
+
+function getTpxOrdinal(node) {
+  // 0-based index among TPX in current ecs.nodes order (stable & matches T1/T2/...)
+  return ecs.nodes.filter(n => n.type === 'tpx').indexOf(node);
+}
+
+// Which props trigger full recompute vs just visual redraw
+const RECOMPUTE_PROPS = new Set([
+  'bits','seed','words','steps','stepLen','angle','twist','resetH','pulsar','x','y','head',
+  'iShape','iLtype','iLimitA','gravStr','tpxRelations'
+]);
+
+// Rafal Randomization locks (per-node, per-prop)
+const RAFAL_LOCKABLE_PROPS = new Set([
+  // TPX
+  'bits','seed','words','steps','stepLen','angle','twist','resetH','head','palSeed','drawMode','colMode',
+  // TPX (gravity + granica innate)
+  'gravStr','iShape','iLtype','iLimitA'
+]);
+function ensureNodeLocks(n){ if(n && !n.lock) n.lock = {}; }
+function isLocked(n, prop){ return !!(n?.lock && n.lock[prop]); }
+function toggleLock(n, prop){ ensureNodeLocks(n); n.lock[prop] = !n.lock[prop]; }
+
+function ensureNodeRelations(n){
+  if (!n || n.type !== 'tpx') return;
+  if (!n.props) n.props = {};
+  if (!n.props.tpxRelations) n.props.tpxRelations = {};
+  if (!n.props.tpxRelStrengths) n.props.tpxRelStrengths = {};
+}
+function getRawRelationValue(n, otherId){
+  ensureNodeRelations(n);
+  const raw = n.props.tpxRelations[otherId];
+  return Number.isFinite(raw) ? raw : 1;
+}
+function getRelationMode(n, otherId){
+  const raw = getRawRelationValue(n, otherId);
+  if (raw === 0) return 2;
+  return raw < 0 ? 1 : 0;
+}
+function getRelationStrengthMagnitude(n, otherId){
+  ensureNodeRelations(n);
+  const s = n.props.tpxRelStrengths?.[otherId];
+  if (Number.isFinite(s) && s > 0) return s;
+  const raw = n.props.tpxRelations?.[otherId];
+  if (Number.isFinite(raw) && raw !== 0) return Math.abs(raw);
+  return 1;
+}
+function setRelationMode(n, otherId, mode){
+  ensureNodeRelations(n);
+  const mag = getRelationStrengthMagnitude(n, otherId);
+  n.props.tpxRelStrengths[otherId] = mag;
+  if (mode === 2) n.props.tpxRelations[otherId] = 0;
+  else n.props.tpxRelations[otherId] = mode === 1 ? -mag : mag;
+  tlxMarkPairPhysicsDirty(true);
+}
+
+const PROP_DEF = {
+  bits:    { lbl:'algorytm', type:'list', opts:lists.bits,  keys:['1','2'] },
+  seed:    { lbl:'ziarno',   type:'action', keys:['3'] },
+  words:   { lbl:'tempa',      step:1, min:1, keys:['4','5'] },
+  steps:   { lbl:'luxy',    step:10, min:1, keys:['6','7'] },
+  stepLen: { lbl:'krok',     step:0.001, format:v=>v.toFixed(4), keys:['s','w'] },
+  angle:   { lbl:'kąt',      step:1, format:v=>v.toFixed(1)+'°', keys:['8','9'] },
+  twist:   { lbl:'skręt',    type:'bool', keys:['q'] },
+  resetH:  { lbl:'rekąt',    type:'bool', keys:['w'] },
+  pulsar:  { lbl:'pulsar',   type:'bool', keys:['e'] },
+  x:       { lbl:'poz X',    step:0.01, format:v=>v.toFixed(3), keys:[] },
+  y:       { lbl:'poz Y',    step:0.01, format:v=>v.toFixed(3), keys:[] },
+  head:    { lbl:'obrót',    step:45, format:v=>v.toFixed(1)+'°', keys:[] },
+  drawMode:{ lbl:'rysuj',    type:'list', opts:lists.draw, keys:['r'] },
+  colMode: { lbl:'kolor',    type:'list', opts:lists.col,  keys:['t'] },
+  blend:   { lbl:'blend',    type:'list', opts:lists.blend, keys:['y'] },
+  alpha:   { lbl:'przezrok', step:0.01, min:0, max:1, format:v=>Math.round(v*100)+'%', keys:['u','i'] },
+  lod:     { lbl:'detal',    step:1, min:1, keys:['[',']'] },
+  palSeed: { lbl:'paleta',   type:'action', keys:['k'] },
+  shape:   { lbl:'forma',    type:'list', opts:lists.shape, keys:['c'] },
+  ltype:   { lbl:'granica',  type:'list', opts:lists.ltype, keys:['v'] },
+  //   limit:   { lbl:'limit',    type:'list', opts:LIMIT_LABELS, keys:['f','g'] }, // legacy, not in NODE_PROPS
+  limitA:  { lbl:'wielkość X', step:0.01, min:0.01, max:88, format:v=>v.toFixed(2), keys:['f','g'] },
+  limitB:  { lbl:'wielkość Y', step:0.01, min:0.01, max:88, format:v=>v.toFixed(2), keys:['t','y'] },
+  gravStr: { lbl:'siła',     step:0.01, format:v=>v.toFixed(3), keys:['s','d'] },
+  iShape:  { lbl:'forma',   type:'list', opts:lists.shape, keys:['j'] },
+  iLtype:  { lbl:'granica', type:'list', opts:lists.ltype, keys:['n'] },
+  iLimitA: { lbl:'promień', step:0.1, min:0, max:8, format:v=>v.toFixed(3), keys:['k','l'] },
+};
+
+// NODE_PROPS: '_sep_X' = group separator (triggers group switch during param registration)
+const NODE_PROPS = {
+  tpx: [
+    '_sep_raf', 'bits','seed','words','steps','stepLen','angle','twist','resetH','pulsar','gravStr',
+    '_sep_mat', 'drawMode','colMode','palSeed','blend','alpha','lod',
+    '_sep_pos', 'x','y','head','iShape','iLtype','iLimitA',
+  ],
+};
+
+const NODE_GROUP_META = {
+  raf: { label:'RAFAŁ inspiruje', order:100 },
+  mat: { label:'',                order:200 },
+  pos: { label:'',                order:300 },
+};
+
+function tlxInferBaseWidget(valueType) {
+  if (valueType === 'bool') return 'row-toggle';
+  if (valueType === 'list') return 'row-select';
+  return 'row-number';
+}
+function tlxInferProController(propKey, valueType) {
+  if (propKey === 'gravStr') return 'gravity-knob';
+  if (propKey === 'angle' || propKey === 'head') return 'angle-wheel';
+  if (propKey === 'mouseGrav') return 'mouse-gravity-fader';
+  if (propKey === 'entropyG') return 'entropy-fader';
+  if (propKey === 'saveHistory') return 'save-history-toggle';
+  if (valueType === 'bool') return 'toggle';
+  if (valueType === 'list') return 'toggle';
+  return 'knob';
+}
+function tlxRegisterCoreParams() {
+  const sceneParams = [
+    {
+      id:'scene.saveHistory', key:'saveHistory', label:'save history', valueType:'bool',
+      hotkeys:{ key:'y' }, group:'scene.memory', order:100,
+      read: ctx => ctx.scene.saveHistory,
+      write: (ctx, v) => { ctx.scene.saveHistory = !!v; },
+      behavior:{ snapHistory:false, recompute:'none' }
+    },
+    {
+      id:'scene.showGrid', key:'showGrid', label:'inwestygacja', valueType:'bool',
+      hotkeys:{ key:'i' }, group:'scene.memory', order:120,
+      read: ctx => ctx.scene.showGrid,
+      write: (ctx, v) => { ctx.scene.showGrid = !!v; syncECS(false); },
+      behavior:{ snapHistory:false, recompute:'soft' }
+    },
+    {
+      id:'scene.amandaEnabled', key:'amandaEnabled', label:'amanda', valueType:'bool',
+      hotkeys:{ key:'a' }, group:'scene.physics', order:100,
+      read: ctx => ctx.scene.sim.amandaEnabled,
+      write: (ctx, v) => { ctx.scene.sim.amandaEnabled = !!v; ctx.scene.sim.accMs = 0; ctx.scene.sim.tick = 0; ctx.scene.sim.lastSnapMs = performance.now(); },
+      behavior:{ snapHistory:true, recompute:'none' }
+    },
+    {
+      id:'scene.amandaG', key:'amandaG', label:'ciężar amandy', valueType:'number',
+      hotkeys:{ key2:['u','p'] }, group:'scene.physics', order:110, min:-8, max:8, step:0.01, format:v=>v.toFixed(2),
+      read: ctx => ctx.scene.sim.amandaG,
+      write: (ctx, v) => { ctx.scene.sim.amandaG = +v.toFixed(3); tlxMarkPairPhysicsDirty(false); },
+      behavior:{ snapHistory:true, recompute:'none' }
+    },
+    {
+      id:'scene.mouseGrav', key:'mouseGrav', label:'ciężar myszy', valueType:'number',
+      hotkeys:{ key2:['j','k'] }, group:'scene.physics', order:120, min:-8, max:8, step:0.01, format:v=>v.toFixed(2),
+      read: ctx => ctx.scene.sim.mouseGrav,
+      write: (ctx, v) => { ctx.scene.sim.mouseGrav = +v.toFixed(3); tlxMarkPairPhysicsDirty(false); },
+      behavior:{ snapHistory:true, recompute:'none' }
+    },
+    {
+      id:'scene.entropyEnabled', key:'entropyEnabled', label:'entropia', valueType:'bool',
+      hotkeys:{ key:'q' }, group:'scene.physics', order:130,
+      read: ctx => ctx.scene.sim.entropyEnabled,
+      write: (ctx, v) => { ctx.scene.sim.entropyEnabled = !!v; tlxMarkPairPhysicsDirty(false); },
+      behavior:{ snapHistory:true, recompute:'none' }
+    },
+    {
+      id:'scene.entropyG', key:'entropyG', label:'ciężar entropii', valueType:'number',
+      hotkeys:{ key2:['n','m'] }, group:'scene.physics', order:140, min:0, max:8, step:0.01, format:v=>v.toFixed(2),
+      read: ctx => ctx.scene.sim.entropyG,
+      write: (ctx, v) => { ctx.scene.sim.entropyG = +v.toFixed(3); tlxMarkPairPhysicsDirty(false); },
+      behavior:{ snapHistory:true, recompute:'none' }
+    },
+    {
+      id:'scene.accumulate', key:'accumulate', label:'akumulacja', valueType:'bool',
+      hotkeys:{ key:';' }, group:'scene.render', order:100,
+      read: ctx => ctx.scene.accumulate,
+      write: (ctx, v) => { ctx.scene.accumulate = !!v; if (!v) ctx.scene.accClear = true; syncECS(false); },
+      behavior:{ snapHistory:false, recompute:'soft' }
+    },
+    {
+      id:'scene.mirror', key:'mirror', label:'lustra', valueType:'list',
+      hotkeys:{ key:'l' }, group:'scene.render', order:110, options: lists.mirror,
+      read: ctx => ctx.scene.mirror,
+      write: (ctx, v) => { ctx.scene.mirror = v; syncECS(false); },
+      behavior:{ snapHistory:false, recompute:'soft' }
+    },
+    {
+      id:'scene.bgMode', key:'bgMode', label:'tło', valueType:'list',
+      hotkeys:{ key:'t' }, group:'scene.render', order:120, options: lists.bg,
+      read: ctx => ctx.scene.bgMode,
+      write: (ctx, v) => { ctx.scene.bgMode = v; if (v === 3) ctx.scene.bgCol = [Math.random(), Math.random(), Math.random()]; syncECS(false); },
+      behavior:{ snapHistory:false, recompute:'soft' }
+    },
+    {
+      id:'scene.ramaMode', key:'ramaMode', label:'rama', valueType:'list',
+      hotkeys:{ key:'n' }, group:'scene.render', order:130, options: lists.rama,
+      read: ctx => ctx.scene.ramaMode,
+      write: (ctx, v) => { ctx.scene.ramaMode = v; syncECS(false); },
+      behavior:{ snapHistory:false, recompute:'soft' }
+    },
+    {
+      id:'scene.sceneRot', key:'sceneRot', label:'obrót', valueType:'number',
+      hotkeys:{ key:'o' }, group:'scene.render', order:140, step:45, format:v=>`${Math.round(v)}°`,
+      read: ctx => ctx.scene.sceneRot,
+      write: (ctx, v) => { ctx.scene.sceneRot = ((v % 360) + 360) % 360; syncECS(false); },
+      behavior:{ snapHistory:false, recompute:'soft' }
+    },
+    {
+      id:'scene.fieldStr', key:'fieldStr', label:'temperatura', valueType:'number',
+      hotkeys:{ key2:['[',']'] }, group:'scene.render', order:150, min:0, max:1, step:0.01, format:v=>v>0?v.toFixed(2)+' ●':'nie',
+      read: ctx => ctx.scene.fieldStr,
+      write: (ctx, v) => { ctx.scene.fieldStr = +v.toFixed(3); syncECS(true); },
+      behavior:{ snapHistory:true, recompute:'hard' }
+    },
+    {
+      id:'scene.gravMode', key:'gravMode', label:'grawitacja', valueType:'list',
+      hotkeys:{ key:'w' }, group:'scene.physics', order:150, options: lists.grav,
+      read: ctx => ctx.scene.gravMode,
+      write: (ctx, v) => { ctx.scene.gravMode = v; tlxMarkPairPhysicsDirty(true); syncECS(true); },
+      behavior:{ snapHistory:true, recompute:'hard' }
+    },
+    {
+      id:'system.maxPtsPreset', key:'maxPtsPreset', label:'limit', valueType:'number',
+      hotkeys:{ key:'m' }, group:'system.gpu', order:100, step:1, format:() => formatPts(MAX_PTS),
+      read: () => PTS_PRESETS.indexOf(MAX_PTS),
+      write: (ctx, v) => { reinitGPU(PTS_PRESETS[((Math.round(v)%PTS_PRESETS.length)+PTS_PRESETS.length)%PTS_PRESETS.length]); },
+      behavior:{ snapHistory:false, recompute:'hard' }
+    },
+    {
+      id:'system.pairDistUnitFrames', key:'pairDistUnitFrames', label:'stała zmiany $', valueType:'number',
+      hotkeys:{ key2:['1','2'] }, group:'system.logic', order:110, step:1, min:1, max:240, format:v=>`${Math.round(v)} STANY`,
+      read: () => TLX_PHYS.pairDistUnitFrames,
+      write: (ctx, v) => { TLX_PHYS.pairDistUnitFrames = Math.round(v); tlxMarkPairPhysicsDirty(false); },
+      behavior:{ snapHistory:false, recompute:'none' }
+    },
+    {
+      id:'system.entropyPerSecond', key:'entropyPerSecond', label:'zmiana na $', valueType:'number',
+      hotkeys:{ key2:['3','4'] }, group:'system.logic', order:120, step:0.01, min:0, max:1, format:v=>Math.round(v*100)+'%',
+      read: () => TLX_PHYS.entropyPerSecond,
+      write: (ctx, v) => { TLX_PHYS.entropyPerSecond = +v.toFixed(3); },
+      behavior:{ snapHistory:false, recompute:'none' }
+    },
+  ];
+
+  for (const p of sceneParams) {
+    tlxRegParam({
+      core: {
+        id: p.id,
+        scope: p.id.startsWith('system.') ? TLX_SCOPES.SYSTEM : TLX_SCOPES.SCENE,
+        targetType: p.id.startsWith('system.') ? 'system' : 'scene',
+        key: p.key,
+        valueType: p.valueType,
+        default: p.default,
+        min: p.min,
+        max: p.max,
+        step: p.step,
+        read: p.read,
+        write: p.write,
+      },
+      presentation: {
+        label: p.label,
+        group: p.group,
+        order: p.order,
+        hotkeys: p.hotkeys || {},
+        baseWidget: tlxInferBaseWidget(p.valueType),
+        proController: tlxInferProController(p.key, p.valueType),
+        options: p.options,
+        format: p.format,
+      },
+      behavior: Object.assign({
+        morphable: false,
+        entropizable: false,
+        midiMappable: true,
+        automatable: true,
+      }, p.behavior || {})
+    });
+  }
+
+  for (const [nodeType, props] of Object.entries(NODE_PROPS)) {
+    let currentGroup = 'gen';
+    for (const key of props) {
+      if (key.startsWith('_sep_')) { currentGroup = key.replace('_sep_', ''); continue; }
+      const pd = PROP_DEF[key];
+      if (!pd) continue;
+      const valueType = pd.type === 'bool' ? 'bool' : pd.type === 'list' ? 'list' : pd.type === 'action' ? 'action' : 'number';
+      tlxRegParam({
+        core: {
+          id: `node.${nodeType}.${key}`,
+          scope: TLX_SCOPES.NODE,
+          targetType: nodeType,
+          key,
+          valueType,
+          default: undefined,
+          min: pd.min,
+          max: pd.max,
+          step: pd.step,
+          read: ctx => ctx.node?.props?.[key],
+          write: (ctx, v) => {
+            if (!ctx.node) return;
+            if (valueType === 'action') return;
+            ctx.node.props[key] = v;
+            clampWords(ctx.node);
+            if (key === 'gravStr' || key === 'x' || key === 'y') tlxMarkPairPhysicsDirty(true);
+            syncECS(RECOMPUTE_PROPS.has(key));
+          },
+        },
+        presentation: {
+          label: pd.lbl,
+          group: `node.${nodeType}.${currentGroup}`,
+          order: (NODE_GROUP_META[currentGroup]?.order || 0) + Object.keys(TLX_REGISTRY.params).length,
+          hotkeys: { key: (pd.keys || []).length === 1 ? pd.keys[0] : null, key2: (pd.keys || []).length >= 2 ? pd.keys : null },
+          baseWidget: valueType === 'action' ? 'row-number' : tlxInferBaseWidget(valueType),
+          proController: tlxInferProController(key, valueType),
+          options: pd.opts,
+          format: key === 'words'
+            ? (v, ctx) => `${v}/${Math.floor(MAX_PTS/Math.max(1, ctx.node?.props?.steps || 1))}`
+            : pd.format,
+        },
+        behavior: {
+          snapHistory: true,
+          recompute: RECOMPUTE_PROPS.has(key) ? 'hard' : 'soft',
+          morphable: ['number','list','bool'].includes(valueType),
+          entropizable: ['number','list','bool'].includes(valueType),
+          midiMappable: valueType !== 'action',
+          automatable: valueType !== 'action',
+          lockable: RAFAL_LOCKABLE_PROPS.has(key),
+          act: valueType === 'action' ? 'actionParam' : undefined,
+        }
+      });
+    }
+  }
+
+  tlxRegGroup({ id:'scene.memory',  scope:TLX_SCOPES.SCENE,  label:'Pamięć',  order:100, params:['scene.showGrid','scene.saveHistory'] });
+  tlxRegGroup({ id:'scene.physics', scope:TLX_SCOPES.SCENE,  label:'Fizyka',  order:200, params:['scene.amandaEnabled','scene.amandaG','scene.mouseGrav','scene.entropyEnabled','scene.entropyG','scene.gravMode'] });
+  tlxRegGroup({ id:'scene.render',  scope:TLX_SCOPES.SCENE,  label:'Render',  order:300, params:['scene.accumulate','scene.mirror','scene.bgMode','scene.ramaMode','scene.fieldStr'] });
+  tlxRegGroup({ id:'system.gpu',    scope:TLX_SCOPES.SYSTEM, label:'GPU',     order:400, params:['system.maxPtsPreset'] });
+  tlxRegGroup({ id:'system.logic',  scope:TLX_SCOPES.SYSTEM, label:'Logikofizyka', order:500, params:['system.pairDistUnitFrames','system.entropyPerSecond'] });
+
+  for (const [k, meta] of Object.entries(NODE_GROUP_META)) {
+    tlxRegGroup({
+      id: `node.tpx.${k}`,
+      scope: TLX_SCOPES.NODE,
+      label: meta.label,
+      order: meta.order,
+      params: Object.values(TLX_REGISTRY.params)
+        .filter(p => p.core.scope === TLX_SCOPES.NODE && p.core.targetType === 'tpx' && p.presentation.group === `node.tpx.${k}`)
+        .sort((a,b)=>a.presentation.order-b.presentation.order)
+        .map(p => p.core.id),
+    });
+  }
+
+  tlxRegView({ id:'base.rootScene', type:'base', layout:'rows', groups:['scene.memory','scene.physics','scene.render','system.gpu','system.logic'] });
+  tlxRegView({ id:'base.nodeInspector', type:'base', layout:'rows', groups:['node.tpx.gen','node.tpx.emit','node.tpx.mat','node.tpx.grav','node.tpx.lim'] });
+  tlxRegView({ id:'pro.physicsDeck', type:'pro', layout:'grid', slots:[
+    { controller:'gravity-knob', param:'node.tpx.gravStr', x:0, y:0, w:2, h:2 },
+    { controller:'mouse-gravity-fader', param:'scene.mouseGrav', x:2, y:0, w:1, h:3 },
+    { controller:'entropy-fader', param:'scene.entropyG', x:3, y:0, w:1, h:3 },
+  ]});
+  tlxRegView({ id:'pro.motionDeck', type:'pro', layout:'grid', slots:[
+    { controller:'angle-wheel', param:'node.tpx.angle', x:0, y:0, w:2, h:2 },
+    { controller:'angle-wheel', param:'node.tpx.head',  x:2, y:0, w:2, h:2 },
+  ]});
+}
+tlxRegisterCoreParams();
+
+function tlxRegisterUiArchitecture() {
+  const exportParams = [
+    {
+      id:'export.nagranie.fpsIdx', key:'fpsIdx', label:'klatki na s', valueType:'list',
+      group:'export.nagranie', order:100, options: lists.expFps, hotkeys:{ key2:['1','2'] },
+      read: () => state.exportCfg.nagranie.fpsIdx,
+      write: (ctx, v) => { state.exportCfg.nagranie.fpsIdx = v; },
+    },
+    {
+      id:'export.nagranie.from', key:'from', label:'początkowy snap', valueType:'number',
+      group:'export.nagranie', order:110, step:1, min:0, hotkeys:{ key2:['3','4'] },
+      read: () => Math.max(0, state.exportCfg.nagranie.from ?? 0),
+      write: (ctx, v) => {
+        const cfg = state.exportCfg.nagranie;
+        cfg.from = Math.round(v);
+        if ((cfg.to >= 0) && cfg.from > cfg.to) cfg.to = cfg.from;
+      },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.nagranie.to', key:'to', label:'końcowy snap', valueType:'number',
+      group:'export.nagranie', order:120, step:1, min:0, hotkeys:{ key2:['5','6'] },
+      read: () => state.exportCfg.nagranie.to < 0 ? historyIdx : Math.min(state.exportCfg.nagranie.to, Math.max(0, historyIdx)),
+      write: (ctx, v) => {
+        const cfg = state.exportCfg.nagranie;
+        cfg.to = Math.round(v);
+        if (cfg.to >= 0 && cfg.from > cfg.to) cfg.from = cfg.to;
+      },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.klisza.framesIdx', key:'framesIdx', label:'klatek łącznie', valueType:'list',
+      group:'export.klisza', order:100, options: lists.expFrames, hotkeys:{ key2:['1','2'] },
+      read: () => state.exportCfg.klisza.framesIdx,
+      write: (ctx, v) => { state.exportCfg.klisza.framesIdx = v; },
+    },
+    {
+      id:'export.klisza.to', key:'to', label:'końcowy snap', valueType:'number',
+      group:'export.klisza', order:110, step:1, min:0, hotkeys:{ key2:['3','4'] },
+      read: () => state.exportCfg.klisza.to < 0 ? historyIdx : Math.min(state.exportCfg.klisza.to, Math.max(0, historyIdx)),
+      write: (ctx, v) => { state.exportCfg.klisza.to = Math.round(v); },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.naswietlisza.framesIdx', key:'framesIdx', label:'klatek łącznie', valueType:'list',
+      group:'export.naswietlisza', order:100, options: lists.expFrames, hotkeys:{ key2:['1','2'] },
+      read: () => state.exportCfg.naswietlisza.framesIdx,
+      write: (ctx, v) => { state.exportCfg.naswietlisza.framesIdx = v; },
+    },
+    {
+      id:'export.naswietlisza.to', key:'to', label:'końcowy snap', valueType:'number',
+      group:'export.naswietlisza', order:110, step:1, min:0, hotkeys:{ key2:['3','4'] },
+      read: () => state.exportCfg.naswietlisza.to < 0 ? historyIdx : Math.min(state.exportCfg.naswietlisza.to, Math.max(0, historyIdx)),
+      write: (ctx, v) => { state.exportCfg.naswietlisza.to = Math.round(v); },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.eksport.from', key:'from', label:'początkowy snap', valueType:'number',
+      group:'export.eksport', order:100, step:1, min:0, hotkeys:{ key2:['1','2'] },
+      read: () => Math.max(0, state.exportCfg.eksport.from ?? 0),
+      write: (ctx, v) => {
+        const cfg = state.exportCfg.eksport;
+        cfg.from = Math.round(v);
+        if ((cfg.to >= 0) && cfg.from > cfg.to) cfg.to = cfg.from;
+      },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.eksport.to', key:'to', label:'końcowy snap', valueType:'number',
+      group:'export.eksport', order:110, step:1, min:0, hotkeys:{ key2:['3','4'] },
+      read: () => state.exportCfg.eksport.to < 0 ? historyIdx : Math.min(state.exportCfg.eksport.to, Math.max(0, historyIdx)),
+      write: (ctx, v) => {
+        const cfg = state.exportCfg.eksport;
+        cfg.to = Math.round(v);
+        if (cfg.to >= 0 && cfg.from > cfg.to) cfg.from = cfg.to;
+      },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.import.from', key:'from', label:'początkowy snap', valueType:'number',
+      group:'export.import', order:100, step:1, min:0, hotkeys:{ key2:['1','2'] },
+      read: () => Math.max(0, state.exportCfg.import.from ?? 0),
+      write: (ctx, v) => {
+        const cfg = state.exportCfg.import;
+        cfg.from = Math.round(v);
+        if ((cfg.to >= 0) && cfg.from > cfg.to) cfg.to = cfg.from;
+      },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.import.to', key:'to', label:'końcowy snap', valueType:'number',
+      group:'export.import', order:110, step:1, min:0, hotkeys:{ key2:['3','4'] },
+      read: () => state.exportCfg.import.to < 0 ? historyIdx : Math.min(state.exportCfg.import.to, Math.max(0, historyIdx)),
+      write: (ctx, v) => {
+        const cfg = state.exportCfg.import;
+        cfg.to = Math.round(v);
+        if (cfg.to >= 0 && cfg.from > cfg.to) cfg.from = cfg.to;
+      },
+      format: v => String(Math.round(v) + 1),
+    },
+    {
+      id:'export.start', key:'start', label:'EKSPORTUJ', valueType:'action',
+      group:'export.action', order:100,
+      read: () => state.exportPct ?? '.START',
+      write: () => {},
+      valueFn: ctx => state.exportPct ?? ({ nagranie: MediaRecorder.isTypeSupported('video/webm') ? '.WEBM' : '.MP4', klisza:'.PNG', naswietlisza:'.PNG', eksport:'.TPX', import:'.TPX' }[ctx.exportAct] || '.START'),
+      behavior: { act:'startExport', snapHistory:false }
+    },
+  ];
+
+  for (const p of exportParams) {
+    tlxRegParam({
+      core: {
+        id: p.id,
+        scope: TLX_SCOPES.EXPORT,
+        targetType: 'export',
+        key: p.key,
+        valueType: p.valueType,
+        min: p.min,
+        max: p.max,
+        step: p.step,
+        read: p.read,
+        write: p.write,
+      },
+      presentation: {
+        label: p.label,
+        group: p.group,
+        order: p.order,
+        hotkeys: p.hotkeys || {},
+        baseWidget: p.valueType === 'action' ? 'row-action' : tlxInferBaseWidget(p.valueType),
+        proController: null,
+        options: p.options,
+        format: p.format,
+        valueFn: p.valueFn,
+        noLR: p.valueType === 'action',
+      },
+      behavior: Object.assign({
+        morphable: false,
+        entropizable: false,
+        midiMappable: false,
+        automatable: false,
+        recompute: 'none',
+        snapHistory: false,
+      }, p.behavior || {})
+    });
+  }
+
+  // override / extend views & groups so entire sacred UI goes through registry
+  tlxRegGroup({
+    id:'ui.root.top',
+    scope: TLX_SCOPES.UI,
+    label:'Root top',
+    order:10,
+    buildRows: (ctx) => [
+      { type:'nav', key:'Escape', label:'USTAWIENIA systemu', value:'', ctx:{type:'ustawienia'} },
+      { type:'action', label:'Tempolux', value:'', _isTitle:true, noLR:true, act:'noop' },
+      { type:'action', key:'h', label:'HOWAJ interfejs', value:'', noLR:true, act:'hud', _isButton:true },
+      { type:'toggle', key:'i', label:'inwestygacja', get:()=>state.showGrid, set:v=>{ state.showGrid=!!v; syncECS(false); } },
+      { type:'toggle', key:'y', label:'zapisuj historię', get:()=>state.saveHistory, set:v=>{ state.saveHistory=!!v; } },
+      { type:'action', key2:['z','x'], label:'historia', value:`${historyIdx+1}/${Math.max(history.length,1)}`, lrFn:d=>historyStep(d), noEnter:true },
+      { type:'action', key:',', label:'SNAP do historii', value:'', noLR:true, act:'snap', _isButton:true },
+      { type:'nav', key:'e', label:'EKSPORTY i importy', value:'', ctx:{type:'eksporty'}, _isButton:true },
+      { type:'nav', key:'g', label:'GRY i zabawy', value:'', ctx:{type:'gry'}, _isButton:true },
+    ]
+  });
+  tlxRegGroup({
+    id:'ui.root.nodes',
+    scope: TLX_SCOPES.UI,
+    label:'Nodes',
+    order:20,
+    buildRows: (ctx) => {
+      const rows = [{ type:'action', key:'1', info:{char:'✻',color:'var(--col-tpx)'}, label:'tpx', value:String(ecs.nodes.filter(n=>n.type==='tpx').length), noLR:true, act:'addNode', nodeType:'tpx' }];
+      for (const t of ['tpx']) {
+        const idxs = ecs.nodes.map((n,i) => n.type===t ? i : -1).filter(i=>i>=0);
+        if (!idxs.length) continue;
+        rows.push(...idxs.map(ni => {
+          const n = ecs.nodes[ni];
+          const dId = getDisplayId(n);
+          const typeGlyph = '✻';
+          const typeColor = 'var(--col-tpx)';
+          const front = (n.colors) ? { type:'thumb', html:tpxBadge(n) }
+            : { type:'key', text:dId, ktype:t, info:{char:typeGlyph, color:typeColor} };
+          return { type:'nav', label:n.name, value:'',
+            front:{ type:'layer-thumb', n },
+            ctx:{type:'node', nodeIdx:ni, _retCursor:0},
+            nodeIdx:ni, _nodeRow:true, _isLayerRow:true };
+        }));
+      }
+      return rows;
+    }
+  });
+  tlxRegGroup({
+    id:'ui.root.actions',
+    scope: TLX_SCOPES.UI,
+    label:'Root actions',
+    order:30,
+    buildRows: () => [
+      { type:'action', key:'r', label:'RAFAŁ inspiruje', value:'', noLR:true, act:'random', _isButton:true },
+    ]
+  });
+  tlxRegGroup({
+    id:'ui.ustawienia.shell',
+    scope: TLX_SCOPES.UI,
+    label:'Ustawienia systemu',
+    order:5,
+    buildRows: () => [
+      { type:'action', label:'Ustawienia systemu', value:'', _isTitle:true, noLR:true, act:'noop' },
+      { type:'nav', pop:true, key:'Escape', label:'WRÓĆ', value:'' },
+    ]
+  });
+
+  // ui.root.export replaced by dedicated eksporty view (nav from E key)
+  tlxRegGroup({
+    id:'ui.eksporty',
+    scope: TLX_SCOPES.UI,
+    label:'Eksporty',
+    order:900,
+    buildRows: () => [
+      { type:'action', label:'Eksporty i importy', value:'', _isTitle:true, noLR:true, act:'noop' },
+      { type:'action', key:'1', label:'Z PLIKU .tpx',        value:'', noLR:true, act:'import',    _isButton:true },
+      { type:'nav',    key:'2', label:'DO PLIKU .tpx',        value:'', ctx:{type:'export', act:'eksport'},      _isButton:true },
+      { type:'action', key:'3', label:'DO OBRAZU .png',       value:state.exportPct??'', hl:state.exportPct!==null, noLR:true, act:'exportpng', _isButton:true },
+      { type:'nav',    key:'4', label:'DO KLISZY .png',       value:'', ctx:{type:'export', act:'klisza'},       _isButton:true },
+      { type:'nav',    key:'5', label:'DO NAŚWIETLISZY .png', value:'', ctx:{type:'export', act:'naswietlisza'}, _isButton:true },
+      { type:'nav',    key:'6', label:'DO FILMU ' + (MediaRecorder.isTypeSupported('video/webm') ? '.webm' : '.mp4'), value:'', ctx:{type:'export', act:'nagranie'},     _isButton:true },
+    ]
+  });
+
+  tlxRegGroup({
+    id:'ui.node.shell',
+    scope: TLX_SCOPES.UI,
+    label:'Node shell',
+    order:10,
+    buildRows: (ctx) => {
+      const n = ctx.node;
+      if (!n) return [];
+      const rafal = n.props?.rafalEnabled !== false;
+      const tpxColor = 'var(--col-tpx)';
+      return [
+        { type:'nav', pop:true, key:'Escape', label:'WRÓĆ', value:'' },
+        // ── Node identity row ────────────────────────────────────────────
+        { type:'action',
+          front:{ type:'thumb', html:tpxBadge(n) },
+          label: n.name, value:'', hl:true, act:'rename', noLR:true },
+        // ── P = pokaż (visibility) ───────────────────────────────────────
+        { type:'toggle', key:'p',
+          front:{ type:'char', text:'✻', color: n.active ? tpxColor : 'var(--txt-mute)' },
+          label:'pokaż',
+          get: () => n.active,
+          set: v => { snapshot(); n.active = !!v; syncECS(true); },
+          snapH: false },
+        // ── L = rafal inspiruje (per-node global randomize gate) ─────────
+        { type:'toggle', key:'l',
+          front:{ type:'char', text:'L', color: rafal ? 'var(--col-random)' : 'var(--txt-mute)' },
+          label:'rafał inspiruje',
+          get: () => n.props.rafalEnabled !== false,
+          set: v => { snapshot(); n.props.rafalEnabled = !!v; renderUI(); },
+          snapH: true },
+        // ── / = PRZEŹWIJ (direct randomize, always works) ────────────────
+        { type:'action', key:'/',
+          front:{ type:'char', text:'/', color:'var(--txt-base)' },
+          label:`PRZEŹWIJ ${n.name}`, value:'', noLR:true, act:'rename', _isButton:true },
+      ];
+    }
+  });
+  // ui.node.meta absorbed into ui.node.shell
+  // Override node.tpx.raf to add RAFAŁ button header row
+  tlxRegGroup({
+    id:'node.tpx.raf',
+    scope: TLX_SCOPES.NODE,
+    label:'RAFAŁ inspiruje',
+    order:100,
+    buildRows: (ctx) => {
+      const n = ctx.node;
+      if (!n || n.type !== 'tpx') return [];
+      const paramIds = ['node.tpx.bits','node.tpx.seed','node.tpx.words','node.tpx.steps',
+                        'node.tpx.angle','node.tpx.twist','node.tpx.resetH','node.tpx.pulsar','node.tpx.gravStr'];
+      return [
+        { type:'action', key:'r',
+          front:{ type:'char', text:'R', color:'var(--col-random)' },
+          label:'RAFAŁ inspiruje', value:'', noLR:true, act:'randomNode', _isButton:true },
+        ...tlxRowsFromParamIds(paramIds, { scope:TLX_SCOPES.NODE, node:n }),
+      ];
+    }
+  });
+
+  // Override node.tpx.pos to merge pos+limit with no header
+  tlxRegGroup({
+    id:'node.tpx.pos',
+    scope: TLX_SCOPES.NODE,
+    label:'',
+    order:300,
+    buildRows: (ctx) => {
+      const n = ctx.node;
+      if (!n || n.type !== 'tpx') return [];
+      const paramIds = ['node.tpx.x','node.tpx.y','node.tpx.head',
+                        'node.tpx.iShape','node.tpx.iLtype','node.tpx.iLimitA'];
+      return tlxRowsFromParamIds(paramIds, { scope:TLX_SCOPES.NODE, node:n });
+    }
+  });
+
+  tlxRegGroup({
+    id:'node.tpx.relations',
+    scope: TLX_SCOPES.NODE,
+    label:'Relacje',
+    order:600,
+    buildRows: (ctx) => {
+      const n = ctx.node;
+      if (!n || n.type !== 'tpx') return [];
+      const others = ecs.nodes.filter(o => o.type === 'tpx' && o.id !== n.id);
+      if (!others.length) return [];
+      return others.map(other => ({
+        type:'list',
+        label: other.name,
+        front:{ type:'thumb', html:`<span class="thumb" style="${thumbStyle(other.colors)}"></span>` },
+        opts: lists.relType,
+        snapH: true,
+        get: () => getRelationMode(n, other.id),
+        set: v => { snapshot(); ensureNodeRelations(n); setRelationMode(n, other.id, v); syncECS(true); }
+      }));
+    }
+  });
+
+  tlxRegGroup({
+    id:'ui.export.shell',
+    scope: TLX_SCOPES.UI,
+    label:'Export shell',
+    order:10,
+    buildRows: (ctx) => {
+      const act = ctx.exportAct;
+      const titles = { nagranie:'Do filmu .webm', klisza:'Do kliszy .png',
+                       naswietlisza:'Do naświetliszy .png', eksport:'Do pliku .tpx', import:'Z pliku .tpx' };
+      const rows = [{ type:'nav', pop:true, key:'Escape', label:'WRÓĆ', value:'' }];
+      if (act && titles[act]) rows.push({ type:'action', label:titles[act], value:'', _isTitle:true, noLR:true, act:'noop' });
+      return rows;
+    }
+  });
+  tlxRegGroup({
+    id:'ui.export.current',
+    scope: TLX_SCOPES.EXPORT,
+    label:'Export current',
+    order:20,
+    buildRows: (ctx) => {
+      const act = ctx.exportAct;
+      if (!act) return [];
+      const map = {
+        nagranie: ['export.nagranie.fpsIdx','export.nagranie.from','export.nagranie.to'],
+        klisza: ['export.klisza.framesIdx','export.klisza.to'],
+        naswietlisza: ['export.naswietlisza.framesIdx','export.naswietlisza.to'],
+        eksport: ['export.eksport.from','export.eksport.to'],
+        import: ['export.import.from','export.import.to'],
+      };
+      const rows = tlxRowsFromParamIds(map[act] || [], Object.assign({}, ctx, { scope:TLX_SCOPES.EXPORT, exportAct:act }));
+      const maxH = Math.max(0, historyIdx);
+      rows.forEach(r => {
+        if (r.type === 'number') r.max = maxH;
+      });
+      return rows.length ? [...rows, Object.assign(tlxRowFromParam('export.start', { scope:TLX_SCOPES.EXPORT, exportAct:act }), { _exportAct:act, hl:state.exportPct!==null })] : [];
+    }
+  });
+
+  // override views with final architecture
+  // ── Schowane: widok kiedy HUD jest schowany (tylko przycisk HOWAJ) ─────
+  tlxRegGroup({
+    id:'ui.schowane',
+    scope: TLX_SCOPES.UI,
+    label:'Schowane',
+    order:1,
+    buildRows: () => [
+      { type:'action', key:'h', label:'HOWAJ interfejs', value:'', noLR:true, act:'hud', _isButton:true }
+    ]
+  });
+
+  // ── Statystyki: camera (root) i system (ustawienia) ───────────────────
+  tlxRegGroup({
+    id:'ui.stat.camera',
+    scope: TLX_SCOPES.UI,
+    label:'Kamera',
+    order:9000,
+    buildRows: () => [
+      { type:'number', key2:['-','='], label:'zoom', snapH:true,
+        get: () => state.zoom,
+        set: v  => { state.zoom = v; syncECS(false); },
+        step:0.1, min:0.01, max:20000,
+        fmt: v  => v.toFixed(3) },
+      { type:'number', key2:['c','v'], label:'x kamery', snapH:true,
+        get: () => -state.panX,
+        set: v  => { state.panX = -v; syncECS(false); },
+        step:0.1,
+        fmt: v  => v.toFixed(4) },
+      { type:'number', key2:['f','b'], label:'y kamery', snapH:true,
+        get: () => -state.panY,
+        set: v  => { state.panY = -v; syncECS(false); },
+        step:0.1,
+        fmt: v  => v.toFixed(4) },
+    ]
+  });
+  tlxRegGroup({
+    id:'ui.stat.system',
+    scope: TLX_SCOPES.UI,
+    label:'Statystyki systemu',
+    order:9000,
+    buildRows: () => [
+      { type:'header', label:'limit', value: () => formatPts(MAX_PTS) },
+      { type:'header', label:'gpu',   value: () => Math.round(MAX_PTS*MAX_CH*16/1024/1024)+'MB' },
+      { type:'header', label:'luxy',  value: () => formatPts(state.stats.pts), _domCls:'stat-currently' },
+      { type:'header', label:'max',   value: () => formatPts(maxBits()) },
+    ]
+  });
+
+  tlxRegView({ id:'base.rootScene', type:'base', layout:'rows', groups:['ui.root.top','ui.root.nodes','ui.root.actions','scene.physics','scene.render','ui.stat.camera'] });
+  tlxRegView({ id:'base.nodeInspector', type:'base', layout:'rows', groups:['ui.node.shell','node.tpx.raf','node.tpx.mat','node.tpx.pos','node.tpx.relations'] });
+  tlxRegView({ id:'base.exportConfig', type:'base', layout:'rows', groups:['ui.export.shell','ui.export.current'] });
+  tlxRegView({ id:'base.eksportyList', type:'base', layout:'rows', groups:['ui.export.shell','ui.eksporty'] });
+  tlxRegView({ id:'base.ustawieniaSystem', type:'base', layout:'rows', groups:['ui.ustawienia.shell','system.gpu','system.logic','ui.stat.system'] });
+  tlxRegView({ id:'base.schowane', type:'base', layout:'rows', groups:['ui.schowane'] });
+}
+
+tlxRegisterUiArchitecture();
+
+function tlxRowsFromParamIds(paramIds, ctxOverrides = {}) {
+  return paramIds
+    .map(paramId => tlxRowFromParam(paramId, ctxOverrides))
+    .filter(Boolean);
+}
+
+// ── Default scene ──────────────────────────────────────────────────────
+let idCounter = 100;
+function newId() { return 'n' + (idCounter++); }
+function syncIdCounterFromNodes(nodes) {
+  let maxId = -1;
+  for (const n of (nodes || [])) {
+    const m = /^n(\d+)$/.exec(String(n?.id || ''));
+    if (!m) continue;
+    maxId = Math.max(maxId, Number(m[1]));
+  }
+  idCounter = Math.max(idCounter, maxId + 1);
+}
+
+const ecs = {
+  // listCursor = selected node index (kept in sync by buildList)
+  listCursor: 0,
+  // UI: context stack + cursor. stack=[] means root.
+  ui:{ stack:[], cursor:0 },
+  nodes: [
+    { id:'n100', type:'tpx', active:true, name:'światło',
+      props:{ bits:3, seed:1836311903, words:420, steps:1440, stepLen:0.018,
+              angle:146, twist:true, resetH:false, pulsar:true,
+              x:-0.28, y:0.12, head:0,
+              drawMode:0, colMode:0, blend:1, alpha:0.05,
+              lod:1, palSeed:1618033988, gravStr:0, tpxRelations:{}, tpxRelStrengths:{},
+              iShape:0, iLtype:1, iLimitA:0.5, rafalEnabled:true } },
+    { id:'n101', type:'tpx', active:true, name:'ożł',
+      props:{ bits:2, seed:2654435761, words:380, steps:1200, stepLen:0.102,
+              angle:181, twist:false, resetH:false, pulsar:true,
+              x:0.004285159977869449, y:0.40184125451817176, head:180,
+              drawMode:3, colMode:0, blend:0, alpha:0.2,
+              lod:1, palSeed:3052094410, gravStr:0, tpxRelations:{}, tpxRelStrengths:{},
+              iShape:0, iLtype:1, iLimitA:0.5, rafalEnabled:true } },
+    { id:'n102', type:'tpx', active:true, name:'coś',
+      props:{ bits:3, seed:3051907830, words:420, steps:888, stepLen:0.02,
+              angle:15, twist:true, resetH:false, pulsar:true,
+              x:-1.778, y:0, head:180,
+              drawMode:2, colMode:0, blend:1, alpha:0.08,
+              lod:1, palSeed:2718281828, gravStr:0, tpxRelations:{}, tpxRelStrengths:{},
+              iShape:0, iLtype:1, iLimitA:0.5, rafalEnabled:true } },
+],
+};
+syncIdCounterFromNodes(ecs.nodes);
+// Init TPX colors
+ecs.nodes.filter(n=>n.type==='tpx').forEach(n => n.colors = genPalColors(n.props.palSeed));
+
+function ensureNodeDyn(n) {
+  if (!n) return;
+  if (!n.dyn) n.dyn = { vx: 0, vy: 0 };
+}
+ecs.nodes.forEach(n => { ensureNodeDyn(n); ensureNodeRelations(n); });
+
+const FIELD_RES = 128; // gradient field grid resolution (NxN)
+
+const state = {
+  panX:0.2000, panY:-0.0000, zoom:1.2370, sceneRot:0, bgMode:0, bgCol:[0,0,0], mirror:0, gravMode: 0,
+  accumulate:false, accClear:true, computing:true, computeProgress:0,
+  redrawAll:false,
+  mulMode:1,
+  fieldStr:0.0,           // gradient field strength [0..1], 0=off
+  ramaMode:0,          // 0=wolny 1=odbicie 2=dziura
+  exportPct:null,      // null=idle, string=status
+  exportCfg: {
+    nagranie:     { fpsIdx:1, from:0, to:-1 },  // to:-1 = ostatnia
+    klisza:       { framesIdx:2, to:-1 },
+    naswietlisza: { framesIdx:2, to:-1 },
+    eksport:      { from:0, to:-1 },
+    import:       { from:0, to:-1 },
+  },
+  showGrid:true, presentDirty:true, flashMsg:null,
+  stats:{ frames:0, fps:0, lastTime:Date.now(), pts:0 },
+  tpxMachines: new Array(MAX_CH).fill(null),
+  saveHistory:true,
+  sim: {
+    fps: TLX_PHYS.simFps,
+    stepMs: 1000 / TLX_PHYS.simFps,
+    accMs: 0,
+    lastTs: performance.now(),
+    tick: 0,
+    amandaEnabled: false,
+    amandaG: 1,
+    mouseWX: 0,
+    mouseWY: 0,
+    mouseGrav: 0,
+    entropyEnabled: false,
+    entropyG: 1,
+    damping: TLX_PHYS.moveDamping,
+    maxVel: TLX_PHYS.maxVel,
+    maxStep: TLX_PHYS.maxStep,
+    lastSnapMs: 0,
+  }
+};
+
+const engine = {
+  emitters: Array.from({length:MAX_CH}, ()=>({active:false})),
+  limits:   Array.from({length:MAX_CH*2}, ()=>({active:false})),
+  gravs:    Array.from({length:MAX_CH}, ()=>({active:false}))
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// HISTORIA — taśma snapshotów, historyIdx = "teraz"
+// z/x = wstecz/naprzód; pan/zoom w snapie ale nie wyzwalają push
+// ══════════════════════════════════════════════════════════════════════
+const HISTORY_MAX = 1991;
+const history = [];
+let   historyIdx = -1;
+let   historyLock = false;
+
+// ══════════════════════════════════════════════════════════════════════
+// EKSPORT ON-DEMAND
+// Zero RAM w tle. Renderujemy klatki z history[] na żądanie.
+// ══════════════════════════════════════════════════════════════════════
+
+// Hook w głównej pętli: gdy GPU skończy liczyć i wyrenderuje klatkę,
+// ten callback jest wywoływany raz, a potem zerowany.
+let captureResolve = null;
+function awaitNextIdle() {
+  return new Promise(resolve => { captureResolve = resolve; });
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function setExportStatus(s) {
+  state.exportPct = s;
+  // Szybki patch DOM bez pełnego re-renderu
+  document.querySelectorAll('[data-expstatus]').forEach(el => {
+    el.textContent = s ?? '';
+  });
+  if (s === null) renderUI();
+}
+
+// GPU readback bieżącej klatki jako ImageBitmap (spec-safe)
+function captureFrameGPU(forceTransBg = false) {
+  return new Promise((resolve, reject) => {
+    const w = canvas.width, h = canvas.height;
+    const bpr0 = w * 4;
+    const bpr  = Math.ceil(bpr0 / 256) * 256;
+    const buf  = device.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+
+    // Tymczasowo nadpisz bgMode jeśli chcemy transparent
+    const savedBg = pArr[0];
+    if (forceTransBg) { pArr[0] = 2; device.queue.writeBuffer(presUniBuf, 0, pArr); }
+
+    const enc = device.createCommandEncoder();
+    const curTex = context.getCurrentTexture();
+    const pp = enc.beginRenderPass({ colorAttachments:[{ view:curTex.createView(), loadOp:'clear', storeOp:'store', clearValue:{r:0,g:0,b:0,a:1} }] });
+    pp.setPipeline(pPipe); pp.setBindGroup(0, pBG); pp.draw(3); pp.end();
+    enc.copyTextureToBuffer({ texture:curTex }, { buffer:buf, bytesPerRow:bpr, rowsPerImage:h }, { width:w, height:h, depthOrArrayLayers:1 });
+    device.queue.submit([enc.finish()]);
+
+    if (forceTransBg) { pArr[0] = savedBg; device.queue.writeBuffer(presUniBuf, 0, pArr); }
+
+    buf.mapAsync(GPUMapMode.READ).then(() => {
+      const mapped = new Uint8Array(buf.getMappedRange());
+      const tight  = new Uint8ClampedArray(w * h * 4);
+      const isBGRA = (format === 'bgra8unorm');
+      for (let y = 0; y < h; y++) {
+        const src = y * bpr, dst = y * bpr0;
+        for (let x = 0; x < w; x++) {
+          const s = src + x*4, d = dst + x*4;
+          tight[d+0] = isBGRA ? mapped[s+2] : mapped[s+0]; // R
+          tight[d+1] = mapped[s+1];                         // G
+          tight[d+2] = isBGRA ? mapped[s+0] : mapped[s+2]; // B
+          tight[d+3] = mapped[s+3];                         // A
+        }
+      }
+      buf.unmap(); buf.destroy();
+      resolve(createImageBitmap(new ImageData(tight, w, h)));
+    }).catch(err => { buf.destroy(); reject(err); });
+  });
+}
+
+// Iteruje przez ostatnie N klatek historii, renderuje każdą i oddaje ImageBitmap[].
+// Na koniec wraca do stanu sprzed eksportu.
+async function renderFramesFromHistory(N, onProgress, forceTransBg = false, toIdx = -1) {
+  const endIdx  = (toIdx < 0 || toIdx > historyIdx) ? historyIdx : toIdx;
+  const total   = Math.min(N, endIdx + 1);
+  if (total === 0) return [];
+  const savedIdx  = historyIdx;
+  const liveSnap  = historySnap();
+  const startIdx  = Math.max(0, endIdx - total + 1);
+  const frames    = [];
+  try {
+    for (let i = startIdx; i <= endIdx; i++) {
+      historyRestore(i);
+      await awaitNextIdle();
+      frames.push(await captureFrameGPU(forceTransBg));
+      if (onProgress) onProgress(frames.length, total);
+    }
+  } finally {
+    applySnap(liveSnap, savedIdx);
+  }
+  return frames;
+}
+
+// ── Eksport PNG bieżącej klatki ─────────────────────────────────────────────
+function exportPNG() {
+  if (state.exportPct !== null) return;
+  const out = document.createElement('canvas');
+  out.width = canvas.width; out.height = canvas.height;
+  const ctx = out.getContext('2d');
+  captureFrameGPU(false).then(bmp => {
+    ctx.drawImage(bmp, 0, 0); bmp.close();
+    out.toBlob(blob => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `tpx_${sceneTag()}_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.png`;
+      a.click(); URL.revokeObjectURL(a.href);
+    }, 'image/png');
+  });
+}
+
+// ── Klisza: auto-grid z N klatek historii, 2048×2048 ────────────────────────
+function kliszaGrid(N) {
+  const cols = Math.ceil(Math.sqrt(N));
+  const rows = Math.ceil(N / cols);
+  return { cols, rows };
+}
+async function exportKlisza(cfg) {
+  if (state.exportPct !== null) return;
+  if (historyIdx < 0) { alert('Brak historii.'); return; }
+  snapshot();
+  state.exportPct = '0%'; renderUI();
+  const c      = cfg || state.exportCfg.klisza;
+  const nFrames = [16,32,64,128][c.framesIdx] ?? 64;
+  const toIdx   = (c.to < 0) ? historyIdx : Math.min(c.to, historyIdx);
+
+  let frames;
+  try {
+    frames = await renderFramesFromHistory(nFrames, (done, total) => {
+      setExportStatus(Math.round(done/total*90) + '%');
+    }, false, toIdx);
+  } catch(err) { setExportStatus(null); alert('Błąd: ' + err.message); return; }
+
+  const N = frames.length;
+  const { cols, rows } = kliszaGrid(N);
+  const OUT  = KLISZA_OUT;
+  const TILE = Math.floor(OUT / cols);
+  const out  = document.createElement('canvas');
+  out.width  = cols * TILE;
+  out.height = rows * TILE;
+  const ctx  = out.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, out.width, out.height);
+
+  for (let i = 0; i < N; i++) {
+    const bmp = frames[N - 1 - i];
+    if (!bmp) continue;
+    const col = i % cols, row = Math.floor(i / cols);
+    const cx = col * TILE, cy = row * TILE;
+    const scale = Math.min(TILE / bmp.width, TILE / bmp.height);
+    const dw = bmp.width * scale, dh = bmp.height * scale;
+    ctx.fillStyle = '#000'; ctx.fillRect(cx, cy, TILE, TILE);
+    ctx.drawImage(bmp, cx + (TILE-dw)/2, cy + (TILE-dh)/2, dw, dh);
+    bmp.close();
+  }
+
+  setExportStatus('PNG...');
+  out.toBlob(blob => {
+    setExportStatus(null);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `klisza_${sceneTag()}_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.png`;
+    a.click(); URL.revokeObjectURL(a.href);
+  }, 'image/png');
+}
+
+// ── Naświetlisza: 64 klatek, lighter blend, rozdzielczość viewportu ──────────
+async function exportNaswietlisza(cfg) {
+  if (state.exportPct !== null) return;
+  if (historyIdx < 0) { alert('Brak historii.'); return; }
+  snapshot();
+  state.exportPct = '0%'; renderUI();
+  const c2     = cfg || state.exportCfg.naswietlisza;
+  const nFrames = [16,32,64,128][c2.framesIdx] ?? 64;
+  const toIdx2  = (c2.to < 0) ? historyIdx : Math.min(c2.to, historyIdx);
+
+  let frames;
+  try {
+    frames = await renderFramesFromHistory(nFrames, (done, total) => {
+      setExportStatus(Math.round(done/total*90) + '%');
+    }, true, toIdx2);
+  } catch(err) { setExportStatus(null); alert('Błąd: ' + err.message); return; }
+
+  const N = frames.length;
+  if (!N) { setExportStatus(null); return; }
+  const W = frames[0].width, H = frames[0].height;
+
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const ctx = out.getContext('2d');
+
+  // Stos lighter (addytywne naświetlanie), bez tła
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 1 / Math.sqrt(N);
+  for (const bmp of frames) { ctx.drawImage(bmp, 0, 0, bmp.width, bmp.height, 0, 0, W, H); bmp.close(); }
+
+  // Dodaj czarne tło pod spodem
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'destination-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+
+  setExportStatus('PNG...');
+  out.toBlob(blob => {
+    setExportStatus(null);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `naswietlisza_${sceneTag()}_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.png`;
+    a.click(); URL.revokeObjectURL(a.href);
+  }, 'image/png');
+}
+
+// ── HiperNagranie: CAŁA historia, render live w viewporcie ───────────────────
+async function exportNagranie(cfg) {
+  if (state.exportPct !== null) return;
+  if (historyIdx < 0) { alert('Brak historii.'); return; }
+  if (!('MediaRecorder' in window)) { alert('Brak MediaRecorder — użyj Chrome/Edge.'); return; }
+  snapshot();
+
+  const cn       = cfg || state.exportCfg.nagranie;
+  const FPS      = [12,24,30,60][cn.fpsIdx] ?? 24;
+  const fromIdx  = Math.max(0, Math.min(cn.from ?? 0, historyIdx));
+  const toIdx    = (cn.to < 0) ? historyIdx : Math.min(cn.to, historyIdx);
+  const startIdx = Math.min(fromIdx, toIdx);
+  const endIdx   = Math.max(fromIdx, toIdx);
+  let mime = 'video/webm;codecs=vp9';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+  // iOS Safari: WebM nie jest wspierane, fallback na MP4/H.264
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/mp4;codecs=avc1';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/mp4';
+  if (!MediaRecorder.isTypeSupported(mime)) { alert('Ten browser nie wspiera nagrywania wideo (brak WebM i MP4).'); return; }
+
+  const W = canvas.width, H = canvas.height;
+  const frameMs    = 1000 / FPS;
+  const bitrate    = Math.round((W * H) / (1920 * 1080) * 160_000_000);
+  const totalFrames = endIdx - startIdx + 1;
+
+  setExportStatus('0/' + totalFrames); renderUI();
+
+  // Oddzielny canvas jako źródło streamu — generuje prawidłowe timestampy i duration
+  // Główny canvas renderuje cząstki live (user widzi), ten łapie każdą klatkę
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = W; outCanvas.height = H;
+  const outCtx = outCanvas.getContext('2d', { alpha: false });
+
+  // captureStream z FPS > 0 = automatyczne timestampy w MediaRecorder
+  const stream = outCanvas.captureStream(FPS);
+  const chunks = [];
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bitrate });
+  const recDone = new Promise((res, rej) => {
+    rec.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
+    rec.onerror = rej; rec.onstop = res;
+  });
+  rec.start();
+
+  const savedIdx = historyIdx;
+  const liveSnap = historySnap();
+  try {
+    let frameNum = 0;
+    for (let i = startIdx; i <= endIdx; i++) {
+      historyRestore(i);
+      await awaitNextIdle();
+      outCtx.drawImage(canvas, 0, 0, W, H);
+      await sleep(frameMs);
+      frameNum++;
+      setExportStatus(`${frameNum}/${totalFrames}`);
+    }
+    // Ostatnia klatka trzymana przez 1s
+    setExportStatus('end...');
+  } catch(err) {
+    // Wróć na ostatnią klatkę — żeby thumbnail wideo w systemie plików był z końca
+    historyRestore(savedIdx);
+    await new Promise(r => setTimeout(r, 80));
+    rec.stop(); 
+    stream.getTracks().forEach(t => t.stop());
+    await recDone.catch(()=>{});
+    applySnap(liveSnap, savedIdx); // Przywróć stan na błąd
+    setExportStatus(null);
+    alert('Błąd nagrania: ' + err.message);
+    return;
+  }
+
+  applySnap(liveSnap, savedIdx); // Przywróć stan na sukces
+  rec.stop();
+  await recDone;
+  setExportStatus(null);
+
+  const blob = new Blob(chunks, { type: mime });
+  const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+  const filename = `nagranie_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.${ext}`;
+  const blobUrl = URL.createObjectURL(blob);
+  const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (isIOS && navigator.canShare) {
+    const file = new File([blob], filename, { type: mime });
+    if (navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: filename });
+        URL.revokeObjectURL(blobUrl);
+        return;
+      } catch(e) {
+        if (e.name === 'AbortError') { URL.revokeObjectURL(blobUrl); return; }
+        // inny błąd — wpadamy do overlay fallback niżej
+      }
+    }
+  }
+  // Fallback: overlay z podglądem (nie-iOS lub Web Share niedostępny)
+  {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.92);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px;box-sizing:border-box;';
+    const info = document.createElement('div');
+    info.style.cssText = 'color:#fff;font-family:monospace;font-size:13px;text-align:center;line-height:1.6;opacity:0.8;';
+    info.textContent = isIOS
+      ? 'Web Share niedostępny.\nPrzytrzymaj wideo palcem → „Zapisz wideo”'
+      : 'Kliknij prawym na wideo → Zapisz';
+    const vid = document.createElement('video');
+    vid.src = blobUrl; vid.controls = true; vid.playsInline = true;
+    vid.style.cssText = 'max-width:100%;max-height:60vh;border:1px solid #444;';
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕ ZAMKNIJ';
+    closeBtn.style.cssText = 'background:transparent;border:1px solid #555;color:#aaa;font-family:monospace;font-size:13px;padding:8px 24px;cursor:pointer;';
+    closeBtn.onclick = () => { overlay.remove(); URL.revokeObjectURL(blobUrl); };
+    overlay.appendChild(info); overlay.appendChild(vid); overlay.appendChild(closeBtn);
+    if (!isIOS) {
+      const dlBtn = document.createElement('a');
+      dlBtn.href = blobUrl; dlBtn.download = filename; dlBtn.textContent = '↓ POBIERZ';
+      dlBtn.style.cssText = 'color:#ff7c38;font-family:monospace;font-size:13px;padding:8px 24px;border:1px solid #ff7c38;text-decoration:none;cursor:pointer;';
+      overlay.insertBefore(dlBtn, closeBtn);
+    }
+    document.body.appendChild(overlay);
+  }
+}
+
+function historySnap() {
+  return {
+    nodes:       JSON.stringify(ecs.nodes),
+    listCursor:  ecs.listCursor,
+    bgMode:      state.bgMode,
+    bgCol:       [...state.bgCol],
+    mirror:      state.mirror,
+    sceneRot:    state.sceneRot,
+    accumulate:  state.accumulate,
+    ramaMode:    state.ramaMode,
+    fieldStr:    state.fieldStr,
+    simAmandaEnabled: state.sim.amandaEnabled,
+    simAmandaG: state.sim.amandaG,
+    simMouseGrav: state.sim.mouseGrav,
+    simEntropyEnabled: state.sim.entropyEnabled,
+    simEntropyG: state.sim.entropyG,
+    panX: state.panX, panY: state.panY, zoom: state.zoom,
+  };
+}
+
+function snapshot(force=false) {
+  if (historyLock) return;
+  if (!state.saveHistory && !force) return;
+  historyIdx++;
+  history[historyIdx] = historySnap();
+
+  // Stara przyszłość NIE jest czyszczona — zostaje jako boczna galeria
+  // Circular cap: gdy taśma za długa, wyrzucamy najstarsze
+  if (historyIdx >= HISTORY_MAX) {
+    history.shift();
+    historyIdx = HISTORY_MAX - 1;
+  }
+}
+
+function applySnap(snap, newIdx) {
+  historyLock = true;
+  if (newIdx !== undefined) historyIdx = newIdx;
+  ecs.nodes = JSON.parse(snap.nodes);
+  ecs.nodes.forEach(n=>{ ensureNodeLocks(n); ensureNodeDyn(n); ensureNodeRelations(n); });
+  ecs.nodes.filter(n => n.type === 'tpx').forEach(n => {
+    if (!n.colors) n.colors = genPalColors(n.props.palSeed);
+  });
+  ecs.listCursor  = Math.min(snap.listCursor, Math.max(0, ecs.nodes.length - 1));
+  state.bgMode    = snap.bgMode;
+  state.bgCol     = [...snap.bgCol];
+  state.mirror    = snap.mirror;
+  state.sceneRot  = snap.sceneRot;
+  state.accumulate = snap.accumulate;
+  state.ramaMode  = snap.ramaMode ?? 0;
+  state.fieldStr  = snap.fieldStr ?? 0;
+  state.sim.amandaEnabled = !!snap.simAmandaEnabled;
+  state.sim.amandaG = +(snap.simAmandaG ?? 1);
+  state.sim.mouseGrav = +(snap.simMouseGrav ?? 0);
+  state.sim.entropyEnabled = !!snap.simEntropyEnabled;
+  state.sim.entropyG = +(snap.simEntropyG ?? 1);
+  state.sim.tick = 0;
+  state.panX = snap.panX; state.panY = snap.panY; state.zoom = snap.zoom;
+  syncECS(true); renderUI();
+  historyLock = false;
+}
+
+function historyRestore(idx) {
+  if (idx < 0 || idx >= history.length || !history[idx]) return;
+  applySnap(history[idx], idx);
+}
+
+function historyStep(dir) { historyRestore(historyIdx + dir); }
+
+
+
+function exportTpx(cfg) {
+  const c      = cfg || state.exportCfg.eksport;
+  const maxIdx = historyIdx;
+  const from   = Math.max(0, c.from ?? 0);
+  const to     = (c.to < 0) ? maxIdx : Math.min(c.to, maxIdx);
+  const fFrom  = Math.min(from, to), fTo = Math.max(from, to);
+  const lines = [];
+  lines.push('TEMPOLUX SESSION');
+  lines.push('================');
+  lines.push(`historia: ${fTo - fFrom + 1} klatek (${fFrom+1}–${fTo+1} z ${maxIdx+1})`);
+  lines.push('');
+
+  const snapToLines = (snap, idx) => {
+    const s = snap;
+    const out = [];
+    out.push(`=== KLATKA ${idx + 1} ===`);
+    out.push(`[scena]`);
+    out.push(`tło: ${lists.bg[s.bgMode] ?? s.bgMode}`);
+    out.push(`mirror: ${lists.mirror[s.mirror] ?? s.mirror}`);
+    out.push(`zoom: ${s.zoom}`);
+    out.push(`panX: ${s.panX}  panY: ${s.panY}`);
+    out.push(`obrót: ${s.sceneRot}`);
+    out.push(`akumuluj: ${s.accumulate ? 'TAK' : 'nie'}`);
+    out.push(`rama: ${lists.rama[s.ramaMode] ?? s.ramaMode}`);
+    out.push('');
+
+    const nodes = JSON.parse(s.nodes);
+    nodes.forEach(n => {
+      const dId = n.type.toUpperCase() + ' — ' + n.name;
+      out.push(`[${dId}]`);
+      out.push(`typ: ${n.type}  aktywny: ${n.active ? 'TAK' : 'nie'}`);
+      if (n.type === 'tpx') {
+        const p = n.props;
+        out.push(`algorytm: ${lists.bits[p.bits] ?? p.bits}`);
+        out.push(`ziarno: ${p.seed}`);
+        out.push(`luxy: ${p.words}  tempa: ${p.steps}  krok: ${p.stepLen}`);
+        out.push(`kąt: ${p.angle}  skręt: ${p.twist ? 'TAK' : 'nie'}  rekąt: ${p.resetH ? 'TAK' : 'nie'}`);
+        out.push(`pozX: ${p.x}  pozY: ${p.y}  obrót: ${p.head}`);
+        out.push(`rysuj: ${lists.draw[p.drawMode] ?? p.drawMode}  kolor: ${lists.col[p.colMode] ?? p.colMode}`);
+        out.push(`blend: ${lists.blend[p.blend] ?? p.blend}  przezrok: ${p.alpha}  detal: ${p.lod}`);
+        out.push(`paleta: ${p.palSeed}`);
+      } else if (n.type === 'stx') {
+        // STX removed — gałąź migracyjna, nie odpali się dla nowych scen
+        out.push(`[stx — legacy]`);
+      }
+      out.push('');
+    });
+    return out.join('\n');
+  };
+
+  for (let i = fFrom; i <= fTo; i++) {
+    if (history[i]) lines.push(snapToLines(history[i], i - fFrom));
+  }
+
+  // Dołącz surowy JSON na końcu (do importu)
+  lines.push('');
+  lines.push('=== RAW (nie edytuj poniżej tej linii) ===');
+  const slicedHistory = history.slice(fFrom, fTo + 1);
+  lines.push(JSON.stringify({ version:1, history: slicedHistory, historyIdx: slicedHistory.length - 1 }));
+
+  const blob = new Blob([lines.join('\n')], { type:'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `tempolux_${sceneTag()}_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.tpx`;
+  a.click(); URL.revokeObjectURL(a.href);
+}
+
+function importTpx(cfg) {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.tpx,application/json,text/plain';
+  input.onchange = e => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const text = ev.target.result;
+        // Szukaj sekcji RAW na końcu pliku
+        const rawMarker = '=== RAW (nie edytuj poniżej tej linii) ===';
+        const rawIdx = text.lastIndexOf(rawMarker);
+        const jsonStr = rawIdx >= 0
+          ? text.slice(rawIdx + rawMarker.length).trim()
+          : text.trim();
+        const payload = JSON.parse(jsonStr);
+        if (!payload.history?.length) { alert('Nieprawidłowy plik .tpx'); return; }
+        // Migrate old format: xptExcludes → tpxRelations (drop xpt nodes)
+        payload.history = payload.history.map(snap => {
+          const nodes = JSON.parse(snap.nodes || '[]')
+            .filter(n => n.type !== 'xpt')
+            .map(n => {
+              if (n.type === 'tpx' && n.props.xptExcludes) {
+                const { xptExcludes, ...rest } = n.props;
+                return { ...n, props: { ...rest, gravStr: n.props.gravStr||0, tpxRelations: n.props.tpxRelations||{}, tpxRelStrengths: n.props.tpxRelStrengths||{} } };
+              }
+              if (n.type === 'tpx') return { ...n, props: { ...n.props, gravStr: n.props.gravStr||0, tpxRelations: n.props.tpxRelations||{}, tpxRelStrengths: n.props.tpxRelStrengths||{}, rafalEnabled: n.props.rafalEnabled !== false } };
+              return n;
+            });
+          return { ...snap, nodes: JSON.stringify(nodes) };
+        });
+        const ic   = cfg || state.exportCfg.import;
+        const iMax = payload.history.length - 1;
+        const iFrom = Math.max(0, ic.from ?? 0);
+        const iTo   = (ic.to < 0) ? iMax : Math.min(ic.to, iMax);
+        const slice = payload.history.slice(Math.min(iFrom,iTo), Math.max(iFrom,iTo) + 1);
+        history.length = 0;
+        slice.forEach(s => history.push(s));
+        historyRestore(slice.length - 1);
+      } catch(err) { alert('Błąd importu: ' + err.message); }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// MEMORY GUARD
+// ══════════════════════════════════════════════════════════════════════
+function clampWords(n) {
+  if (n.type !== 'tpx') return;
+  const maxWords = Math.floor(MAX_PTS / Math.max(1, n.props.steps));
+  n.props.words = Math.max(1, Math.min(n.props.words, maxWords));
+}
+function maxBits() {
+  return ecs.nodes.filter(n => n.type==='tpx' && n.active).length * MAX_PTS;
+}
+
+// UI formatting helpers
+function formatPts(n) {
+  // Keep it intentionally simple and stable (used in HUD only)
+  const x = Math.max(0, Math.floor(Number(n) || 0));
+  if (x >= 1_000_000) {
+    const m = x / 1_000_000;
+    return (Math.round(m * 10) / 10).toString().replace(/\.0$/, '') + 'M';
+  }
+  if (x >= 1_000) return Math.round(x / 1_000) + 'k';
+  return String(x);
+}
+
+function sceneTag() {
+  const t = ecs.nodes.filter(n=>n.type==='tpx'&&n.active).length;
+  return `T${t}`;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ECS OPERATIONS
+// ══════════════════════════════════════════════════════════════════════
+function addNode(type) {
+  // Enforce hardware limit: max MAX_CH per type
+  const count = ecs.nodes.filter(n => n.type === type).length;
+  if (count >= MAX_CH) {
+    state.flashMsg = `max ${MAX_CH} ${TYPE_NAME[type] || type} (limit GPU)`;
+    setTimeout(() => { state.flashMsg = null; renderUI(); }, 2000);
+    renderUI(); return;
+  }
+  snapshot();
+  const typeCount = ecs.nodes.filter(n => n.type === type).length + 1;
+  const id = newId();
+  let name  = TYPE_NAME[type] + ' ' + typeCount;
+  let props = {};
+  if (type === 'tpx') {
+    name  = 'tpx ' + typeCount;
+    props = { bits:0, seed:Date.now()>>>0, words:420, steps:888, stepLen:0.02, angle:15.0,
+              twist:false, resetH:true, pulsar:false, x:0, y:0, head:0, drawMode:0, colMode:0,
+              blend:0, alpha:0.5, lod:1, palSeed:Date.now()>>>0,
+              gravStr:0, tpxRelations:{}, tpxRelStrengths:{},
+              iShape:0, iLtype:1, iLimitA:0.5, rafalEnabled:true };
+  }
+  const newNode = { id, type, active:true, name, props, lock:{}, dyn:{ vx:0, vy:0 } };
+  if (type === 'tpx') newNode.colors = genPalColors(props.palSeed);
+  ecs.nodes.push(newNode);
+  ecs.listCursor = ecs.nodes.length - 1;
+  ecs.ui.stack = [];  // back to root so new node appears
+  ecs.ui.cursor = 0;
+  syncECS(true); renderUI();
+}
+
+function deleteNode(index) {
+  if (index < 0 || index >= ecs.nodes.length) return;
+  snapshot();
+  const deadId = ecs.nodes[index].id;
+  // remove from tpxRelations in other TPX nodes
+  ecs.nodes.forEach(n => {
+    if (n.type !== 'tpx') return;
+    if (n.props.tpxRelations) delete n.props.tpxRelations[deadId];
+    if (n.props.tpxRelStrengths) delete n.props.tpxRelStrengths[deadId];
+  });
+  ecs.nodes.splice(index, 1);
+  ecs.listCursor = Math.max(0, Math.min(index, ecs.nodes.length-1));
+  // Pop node context if we deleted the node we were viewing
+  if (ecs.ui.stack.length > 0 && ecs.ui.stack[ecs.ui.stack.length-1].type === 'node') {
+    ecs.ui.stack.pop();
+  }
+  ecs.ui.cursor = 0;
+  syncECS(true); renderUI();
+}
+
+
+function randomizeNode(n) {
+  if (!n) return;
+  snapshot(); // obeys saveHistory toggle (unless user forced snapshot elsewhere)
+  ensureNodeLocks(n);
+
+  if (n.type === 'tpx') {
+    if (!isLocked(n,'bits'))     n.props.bits     = Math.floor(Math.random() * lists.bits.length);
+    if (!isLocked(n,'seed'))     n.props.seed     = Date.now()>>>0;
+    if (!isLocked(n,'words'))    n.props.words    = 50 + Math.floor(Math.random()*500);
+    if (!isLocked(n,'steps'))    n.props.steps    = 200 + Math.floor(Math.random()*2000);
+    if (!isLocked(n,'stepLen'))  n.props.stepLen  = 0.005 + Math.random()*0.08;
+    if (!isLocked(n,'angle'))    n.props.angle    = Math.random()*360;
+    if (!isLocked(n,'twist'))    n.props.twist    = Math.random()>0.5;
+    if (!isLocked(n,'resetH'))   n.props.resetH   = Math.random()>0.5;
+    if (!isLocked(n,'head'))     n.props.head     = Math.random()*360;
+    if (!isLocked(n,'palSeed'))  n.props.palSeed  = Date.now()>>>0;
+    if (!isLocked(n,'drawMode')) n.props.drawMode = Math.floor(Math.random() * lists.draw.length);
+    if (!isLocked(n,'colMode'))  n.props.colMode  = Math.floor(Math.random() * lists.col.length);
+
+    n.colors = genPalColors(n.props.palSeed);
+    clampWords(n);
+    syncECS(true);
+  }
+  renderUI();
+}
+
+function randomizeAll() {
+  snapshot();
+  historyLock = true;
+  ecs.nodes.filter(n => n.props?.rafalEnabled !== false).forEach(n => randomizeNode(n));
+  historyLock = false;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// SYNC ECS → ENGINE → GPU
+// ══════════════════════════════════════════════════════════════════════
+function syncECS(doCompute = false) {
+  engine.emitters.forEach(e => e.active = false);
+  engine.limits.forEach(l => l.active = false);
+  engine.gravs.forEach(g => g.active = false);
+
+  // Build tpxSlotMap: tpxId → grav/emitter slot index
+  const tpxSlotMap = {};
+  let slotIdx = 0;
+  for (const n of ecs.nodes) {
+    if (n.type !== 'tpx' || !n.active) continue;
+    if (slotIdx >= MAX_CH) break;
+    tpxSlotMap[n.id] = slotIdx++;
+  }
+
+  // TPX innate limits → lm slots 0..MAX_CH-1
+  let tpxLimIdx = 0;
+  for (const n of ecs.nodes) {
+    if (tpxLimIdx >= MAX_CH) break;
+    if (n.type !== 'tpx' || !n.active) continue;
+    if ((n.props.iShape||0) > 0 && (n.props.iLtype||0) > 0) {
+      const l = engine.limits[tpxLimIdx];
+      l.active=true; l.shape=n.props.iShape; l.type=n.props.iLtype;
+      l.limitA=n.props.iLimitA||0.5; l.x=n.props.x; l.y=n.props.y;
+    }
+    tpxLimIdx++;
+  }
+
+  // Rama: globalna granica viewportu — lm slot MAX_CH*2-1 (last slot)
+  if (state.ramaMode > 0) {
+    const asp = canvas.width / canvas.height;
+    const l = engine.limits[MAX_CH * 2 - 1];
+    l.active=true; l.shape=255; // AABB special case (Rama)
+    l.type=state.ramaMode;
+    l.limitA = asp / state.zoom;
+    l.limitB = 1.0 / state.zoom;
+    l.x = -state.panX; l.y = -state.panY;
+  }
+
+  // Map TPX → grav slots (each TPX is also a gravity well at its own x,y)
+  let gravIdx = 0;
+  for (const n of ecs.nodes) {
+    if (gravIdx >= MAX_CH) break;
+    if (n.type !== 'tpx' || !n.active) continue;
+    const g = engine.gravs[gravIdx];
+    g.active=true; g.x=n.props.x; g.y=n.props.y; g.str=n.props.gravStr||0;
+    gravIdx++;
+  }
+
+  // Map TPX → emitter slots
+  let emIdx = 0;
+  for (const n of ecs.nodes) {
+    if (emIdx >= MAX_CH) break;
+    if (n.type !== 'tpx' || !n.active) continue;
+    clampWords(n);
+    const e = engine.emitters[emIdx];
+    e.active=true; e.tpxId=n.id;
+    e.bits=n.props.bits; e.seed=n.props.seed;
+    if (doCompute) state.tpxMachines[emIdx] = (n.props.bits===7) ? new PIGenerator() : new TPXMachine(n.props.seed);
+    e.x=n.props.x; e.y=n.props.y; e.head=n.props.head;
+    e.words=n.props.words; e.steps=n.props.steps; e.stepLen=n.props.stepLen;
+    e.angle=n.props.angle; e.twist=n.props.twist; e.resetH=n.props.resetH; e.pulsar=n.props.pulsar||false;
+    e.drawMode=n.props.drawMode; e.colMode=n.props.colMode;
+    e.blend=n.props.blend; e.alpha=n.props.alpha; e.lod=n.props.lod;
+    if (n.colors) Object.assign(e, n.colors);
+    if (n.props.colMode === 9) {
+      const ord = Math.max(0, getTpxOrdinal(n));
+      const base = STREAM_HUE_LUT[ord % STREAM_HUE_LUT.length];
+      Object.assign(e, hueGradientFromBase(base));
+    }
+    // Per-grav relation floats: tpxRelations[otherTpxId] → multiplier for that grav slot
+    // relFloats[j] = multiplier for grav slot j (0 = no effect, + = attract, - = repel)
+    // Default: all OTHER active TPX slots = 1.0 (Naturalna) — explicit entries override
+    e.relFloats = new Array(MAX_CH).fill(0);
+    for (const [otherId, slot] of Object.entries(tpxSlotMap)) {
+      if (otherId !== n.id) e.relFloats[slot] = 1.0;
+    }
+    const rels = n.props.tpxRelations || {};
+    for (const [otherId, mul] of Object.entries(rels)) {
+      const slot = tpxSlotMap[otherId];
+      if (slot !== undefined) e.relFloats[slot] = mul;
+    }
+    emIdx++;
+  }
+
+  if (doCompute) {
+    state.computing=true; state.computeProgress=0;
+    if (!state.accumulate) state.accClear=true;
+  } else {
+    state.computing=false; state.redrawAll=true;
+    if (!state.accumulate) state.accClear=true;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// UI SYSTEM — context stack, typed rows, single dispatch
+// Row types: nav | action | toggle | list | number | header
+// ══════════════════════════════════════════════════════════════════════
+
+// Global visual helpers used by buildList and renderUI
+function kb(text, cls) {
+  const ESC_ALIASES = { Escape:'ESC', ArrowLeft:'←', ArrowRight:'→', ArrowUp:'↑', ArrowDown:'↓', Enter:'ENT', Backspace:'⌫' };
+  const display = ESC_ALIASES[text] ?? ((text && text.length === 1) ? text.toUpperCase() : text);
+  return `<span class="kb${cls ? ' kb--'+cls : ''}">${display}</span>`;
+}
+function kbChar(char, color) { return `<span class="kb--char" style="color:${color}">${char}</span>`; }
+function thumbStyle(colors) {
+  if (!colors?.h0) return 'background:#222';
+  const c = r => `rgb(${Math.round(r[0]*255)},${Math.round(r[1]*255)},${Math.round(r[2]*255)})`;
+  return `background:linear-gradient(to right,${c(colors.h0)},${c(colors.h1)},${c(colors.h2)})`;
+}
+function colModeThumb(n) {
+  const ord = Math.max(0, getTpxOrdinal(n));
+  switch (n.props.colMode) {
+    case 0: return { h0:[0.10,0.20,0.90], h1:[1.00,1.00,1.00], h2:[0.95,0.15,0.15] };
+    case 1: return n.colors;
+    case 2: return { h0:[0.04,0.04,0.04], h1:[0.50,0.50,0.50], h2:[0.95,0.95,0.95] };
+    case 3: return { h0:[0.55,0.05,0.00], h1:[0.95,0.50,0.05], h2:[1.00,0.95,0.55] };
+    case 4: return { h0:[0.00,0.00,0.00], h1:[1.00,1.00,1.00], h2:[0.00,0.00,0.00] };
+    case 5: return { h0:[0.10,0.90,0.10], h1:[0.95,0.95,0.00], h2:[0.90,0.05,0.90] };
+    case 6: return { h0:[0.05,0.00,0.55], h1:[0.55,0.05,0.90], h2:[0.00,0.85,1.00] };
+    case 7: return { h0:[0.03,0.03,0.03], h1:[0.45,0.45,0.45], h2:[0.92,0.92,0.92] };
+    case 8: return { h0:[0.92,0.92,0.92], h1:[0.45,0.45,0.45], h2:[0.03,0.03,0.03] };
+    case 9: return hueGradientFromBase(STREAM_HUE_LUT[ord % STREAM_HUE_LUT.length]);
+    default: return n.colors;
+  }
+}
+function tpxBadge(n) {
+  const bg = thumbStyle(colModeThumb(n));
+  const blendCols = ['var(--border-kb)', '#c87', '#8bc', '#b8c', '#888', '#bb8'];
+  const borderCol = blendCols[n.props.blend] ?? 'var(--border-kb)';
+  const glyph = n.props.drawMode === 0 ? '─' : n.props.drawMode === 2 ? '+' : n.props.drawMode === 3 ? '0' : '·';
+  const glyphBright = Math.round(85 + n.props.alpha * 170);
+  const glyphCol = `rgb(${glyphBright},${glyphBright},${glyphBright})`;
+  return `<span class="thumb" style="${bg};border-color:${borderCol}"><span style="color:${glyphCol}">${glyph}</span></span>`;
+}
+
+
+function tlxRowFromParam(paramId, ctxOverrides = {}) {
+  const def = TLX_REGISTRY.params[paramId];
+  if (!def) return null;
+  const ctx = tlxParamCtx(ctxOverrides);
+  const hotkeys = def.presentation.hotkeys || {};
+  const valueType = def.core.valueType;
+
+  const base = {
+    label: def.presentation.label,
+    _paramId: paramId,
+    _scope: def.core.scope,
+  };
+  if (ctx.node) {
+    base._ni = ecs.nodes.indexOf(ctx.node);
+    base._prop = def.core.key;
+    base._lockable = !!def.behavior.lockable;
+  }
+
+  const read = () => tlxReadParam(paramId, ctx);
+  const write = v => { tlxWriteParam(paramId, ctx, v); tlxMarkUiDirty('value', paramId); };
+
+  if (valueType === 'action') {
+    return {
+      ...base,
+      type:'action',
+      key: hotkeys.key || null,
+      key2: hotkeys.key2 || null,
+      noLR: def.presentation.noLR !== false,
+      act: def.behavior.act || def.presentation.act || null,
+      value: def.presentation.valueFn ? (() => def.presentation.valueFn(ctx)) : (def.presentation.value ?? (read ? (() => read()) : '·')),
+      snapH: !!def.behavior.snapHistory,
+      _actionParamId: paramId,
+    };
+  }
+
+  if (valueType === 'bool') {
+    return {
+      ...base,
+      type:'toggle',
+      key: hotkeys.key || null,
+      get: read,
+      set: write,
+      snapH: !!def.behavior.snapHistory,
+    };
+  }
+
+  if (valueType === 'list') {
+    return {
+      ...base,
+      type:'list',
+      key: hotkeys.key || null,
+      opts: typeof def.presentation.options === 'function' ? def.presentation.options(ctx) : def.presentation.options,
+      get: read,
+      set: write,
+      snapH: !!def.behavior.snapHistory,
+    };
+  }
+
+  return {
+    ...base,
+    type:'number',
+    key: hotkeys.key || null,
+    key2: hotkeys.key2 || null,
+    step: def.core.step ?? 1,
+    min: def.core.min,
+    max: def.core.max,
+    get: read,
+    set: write,
+    snapH: !!def.behavior.snapHistory,
+    fmt: def.presentation.format ? (v => def.presentation.format(v, ctx)) : undefined,
+  };
+}
+
+function tlxNormalizeRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  const out = [];
+  for (const row of rows) {
+    if (Array.isArray(row)) out.push(...tlxNormalizeRows(row));
+    else if (row) out.push(row);
+  }
+  return out;
+}
+
+function tlxRowsFromGroup(groupId, ctxOverrides = {}) {
+  const group = TLX_REGISTRY.groups[groupId];
+  if (!group) return [];
+  const ctx = tlxParamCtx(ctxOverrides);
+  if (typeof group.buildRows === 'function') {
+    return tlxNormalizeRows(group.buildRows(ctx) || []);
+  }
+  return tlxNormalizeRows(tlxRowsFromParamIds(group.params || [], ctxOverrides));
+}
+
+function tlxBuildRowsFromView(viewId, ctxOverrides = {}) {
+  const view = TLX_REGISTRY.views[viewId];
+  if (!view) return [];
+  TLX_RUNTIME_UI.activeViewId = viewId;
+  return (view.groups || []).map(groupId => tlxRowsFromGroup(groupId, ctxOverrides)).filter(rows => rows.length);
+}
+
+function buildList(stack) {
+  const ctx = stack.length > 0 ? stack[stack.length - 1] : { type:'root' };
+  const groups = [], flat = [];
+  const push = rows => { if (!rows.length) return; groups.push(rows); rows.forEach(r => flat.push(r)); };
+
+  if (ctx.type === 'root') {
+    tlxBuildRowsFromView('base.rootScene', { scope:TLX_SCOPES.SCENE }).forEach(rows => push(rows));
+  }
+
+  if (ctx.type === 'schowane') {
+    tlxBuildRowsFromView('base.schowane', { scope:TLX_SCOPES.UI }).forEach(rows => push(rows));
+  }
+
+  if (ctx.type === 'eksporty') {
+    tlxBuildRowsFromView('base.eksportyList', { scope:TLX_SCOPES.UI }).forEach(rows => push(rows));
+  }
+
+  if (ctx.type === 'ustawienia') {
+    tlxBuildRowsFromView('base.ustawieniaSystem', { scope:TLX_SCOPES.SYSTEM }).forEach(rows => push(rows));
+  }
+
+  if (ctx.type === 'gry') {
+    push([{ type:'action', label:'GRY i zabawy', value:'', _isTitle:true, noLR:true, act:'noop' }]);
+    push([{ type:'nav', pop:true, key:'Escape', label:'WRÓĆ', value:'' }]);
+    // ── Dyskietka ──────────────────────────────────────────────────
+    if (_loadedMod) {
+      push([{
+        type: 'nav',
+        key:  'd',
+        label: `💾 ${_loadedMod.MANIFEST?.name ?? 'Dyskietka'}`,
+        value: () => _loadedMod.MANIFEST?.version ?? '',
+        ctx: { type: _loadedMainCtxType ?? 'diskette_main', _fromDiskette: true },
+      }]);
+      push([{
+        type: 'action', key: 'q',
+        label: '⏏ EJECT dyskietkę', value: '',
+        noLR: true, act: 'ejectDiskette', _isButton: true,
+      }]);
+    } else {
+      push([{
+        type: 'action', key: 'd',
+        label: 'WCZYTAJ DYSKIETKĘ', value: '',
+        noLR: true, act: 'loadDiskette', _isButton: true,
+      }]);
+    }
+  }
+
+  // Dyskietka — własne typy kontekstu
+  if (_contextHandlers.has(ctx.type)) {
+    _contextHandlers.get(ctx.type)(ctx, push);
+  }
+
+  if (ctx.type === 'export') {
+    tlxBuildRowsFromView('base.exportConfig', { scope:TLX_SCOPES.EXPORT, exportAct:ctx.act }).forEach(rows => push(rows));
+  }
+
+  if (ctx.type === 'node') {
+    const ni = ctx.nodeIdx;
+    const n = ecs.nodes[ni];
+    if (!n) { stack.pop(); return buildList(stack); }
+    ecs.listCursor = ni;
+    tlxBuildRowsFromView('base.nodeInspector', { scope:TLX_SCOPES.NODE, node:n }).forEach(rows => push(rows));
+  }
+
+  return { flat, groups };
+}
+
+// ── Row value / front helpers ──────────────────────────────────────────
+function rowValue(r) {
+  if (r.type==='toggle') return r.get() ? 'TAK' : 'nie';
+  if (r.type==='list')   return r.opts[r.get()];
+  if (r.type==='number') return r.fmt ? r.fmt(r.get()) : String(r.get());
+  const v = r.value;
+  return (typeof v === 'function') ? v() : (v ?? '');
+}
+function rowFront(r) {
+  if (r.front) return r.front;
+  if (r.key2)  return { type:'key2', texts:r.key2 };
+  if (r.key)   return { type:'key', text:r.key, ...(r.info ? {info:r.info} : {}) };
+  return null;
+}
+function rowHl(r) {
+  if (r.hl) return true;
+  if (r.type==='toggle') return r.get();
+  return false;
+}
+
+// ── Unified input handler ──────────────────────────────────────────────
+// ── Unified action map — every named action lives here ────────────────
+const ACTIONS = {
+  hud:         ()  => {
+    const top = ecs.ui.stack[ecs.ui.stack.length - 1];
+    if (top?.type === 'schowane') { ecs.ui.stack.pop(); }
+    else { ecs.ui.stack.push({ type:'schowane' }); }
+    renderUI();
+  },
+  snap:        ()  => { snapshot(true); renderUI(); },
+  import:      ()  => importTpx(),
+  export:      ()  => exportTpx(),
+  exportpng:   ()  => exportPNG(),
+  random:      ()  => randomizeAll(),
+  randomNode:  ()  => randomizeNode(ecs.nodes[ecs.listCursor]),
+  clear:       ()  => { state.accClear=true; syncECS(false); renderUI(); },
+  rename:      ()  => { const name=prompt('Nowa nazwa:',ecs.nodes[ecs.listCursor]?.name||''); if(name!=null&&name!==''){snapshot();ecs.nodes[ecs.listCursor].name=name;renderUI();} },
+  noop:        ()  => {},
+  addNode:     (r) => addNode(r.nodeType),
+  loadDiskette:()  => loadDiskette(),
+  ejectDiskette:() => ejectDiskette(),
+  actionParam: (r) => {
+    const n = ecs.nodes[r._ni ?? ecs.listCursor];
+    if (r._paramId === 'node.tpx.seed') {
+      snapshot();
+      if (!n) return;
+      n.props.seed = Date.now()>>>0;
+      syncECS(true);
+      renderUI();
+      return;
+    }
+    if (r._paramId === 'node.tpx.palSeed') {
+      snapshot();
+      if (!n) return;
+      n.props.palSeed = Date.now()>>>0;
+      n.colors = genPalColors(n.props.palSeed);
+      syncECS(true);
+      renderUI();
+      return;
+    }
+  },
+  startExport: (r) => {
+    const act = r._exportAct;
+    const cfg = state.exportCfg[act];
+    if (act==='nagranie')          exportNagranie(cfg);
+    else if (act==='klisza')       exportKlisza(cfg);
+    else if (act==='naswietlisza') exportNaswietlisza(cfg);
+    else if (act==='eksport')      exportTpx(cfg);
+    else if (act==='import')       importTpx(cfg);
+  },
+};
+
+function handleRow(row, dir, force) {
+  if (!row) return;
+
+  if (row.type === 'nav') {
+    if (row.lrFn && dir !== 0) { row.lrFn(dir); renderUI(); return; }
+    if (!force && !row.pop) return;
+    if (row.pop) {
+      const top = ecs.ui.stack.pop();
+      ecs.ui.cursor = top?._retCursor ?? 0;
+    } else if (row.ctx) {
+      row.ctx._retCursor = ecs.ui.cursor;
+      if (row.nodeIdx !== undefined) ecs.listCursor = row.nodeIdx;
+      ecs.ui.stack.push(row.ctx);
+      ecs.ui.cursor = 0;
+    }
+    renderUI(); return;
+  }
+
+  if (row.type === 'action') {
+    if (row.lrFn && dir !== 0) { row.lrFn(dir); renderUI(); return; }
+    if (!force && row.noLR) return;
+    // act może być stringiem (ACTIONS[key]) lub obiektem { fn } (dyskietka)
+    if (row.act && typeof row.act === 'object' && typeof row.act.fn === 'function') { row.act.fn(row); return; }
+    const fn = ACTIONS[row.act];
+    if (fn) { fn(row); return; }
+    return;
+  }
+
+  if (row.type === 'toggle') {
+    if (!force && dir===0) return;
+    if (row.snapH) snapshot();
+    row.set(!row.get());
+    renderUI(); return;
+  }
+
+  if (row.type === 'list') {
+    if (dir===0 && !force) return;
+    if (row.snapH) snapshot();
+    const cur = row.get();
+    row.set((cur + (dir||1) + row.opts.length) % row.opts.length);
+    renderUI(); return;
+  }
+
+  if (row.type === 'number') {
+    if (dir===0) return;
+    if (row.snapH) snapshot();
+    let v = row.get() + row.step * dir;
+    if (row.min !== undefined) v = Math.max(row.min, v);
+    if (row.max !== undefined) v = Math.min(row.max, v);
+    row.set(v);
+    renderUI(); return;
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// RENDER UI
+// ══════════════════════════════════════════════════════════════════════
+function performRenderUI() {
+  hud.classList.remove('hidden');
+
+  // ── Build list from current stack ───────────────────────────────────
+  const { flat, groups } = buildList(ecs.ui.stack);
+  ecs.ui.cursor = Math.max(0, Math.min(flat.length - 1, ecs.ui.cursor));
+  state.uiFlat = flat;
+
+  // ── Render each row ─────────────────────────────────────────────────
+  function renderFront(r, fi) {
+    const f = rowFront(r);
+    if (!f) return '<div class="row-keys row-keys--empty"></div>';
+
+    let html = '';
+    let keysCls = 'row-keys';
+
+    if (f.type === 'key') {
+      keysCls += ' row-keys--single';
+      const keyHtml = kb(f.text, f.ktype);
+      const infoHtml = f.info ? kbChar(f.info.char, f.info.color) : '';
+      html = `<span data-zone="key" data-key="${(f.text||'').toLowerCase()}" style="display:contents">${keyHtml}${infoHtml}</span>`;
+    } else if (f.type === 'key2') {
+      keysCls += ' row-keys--double';
+      html = (f.texts||[]).map((t,i) =>
+        `<span data-zone="key" data-key="${t.toLowerCase()}" data-dir="${i===0?-1:1}" style="display:contents">${kb(t)}</span>`
+      ).join('');
+    } else if (f.type === 'thumb') {
+      keysCls += ' row-keys--thumb';
+      html = `<span data-zone="key" style="display:contents">${f.html}</span>`;
+    } else if (f.type === 'layer-thumb') {
+      keysCls += ' row-keys--layer';
+      const badge = tpxBadge(f.n);
+      html = `<span class="zaslepka"></span><span data-zone="key" style="display:contents">${badge}</span>`;
+    } else if (f.type === 'wide') {
+      keysCls += ' row-keys--single';
+      html = `<span data-zone="key" data-key="${(f.text||'').toLowerCase()}" style="display:contents"><span class="kb kb--wide">${f.text}</span></span>`;
+    } else if (f.type === 'char') {
+      keysCls += ' row-keys--single';
+      html = `<span data-zone="key" style="display:contents">${kbChar(f.text, f.color)}</span>`;
+    }
+
+    return `<div class="${keysCls}">${html}</div>`;
+  }
+
+  function renderRow(r, fi) {
+    const active = (fi === ecs.ui.cursor);
+    const hl = rowHl(r);
+    const val = r._valueIsHtml ? r.value : escHtml(String(rowValue(r)));
+    const muted = r._nodeRow && !ecs.nodes[r.nodeIdx]?.active && !active;
+
+    let cls = 'row';
+
+    if (active) cls += ' row--active';
+    if (muted)  cls += ' row--muted';
+
+    if (r.type === 'header') cls += ' row--stat';
+    if (r.type === 'nav') cls += ' row--nav';
+    if (r.type === 'action') cls += ' row--action';
+    if (r.type === 'toggle') cls += ' row--toggle';
+    if (r.type === 'list') cls += ' row--list';
+    if (r.type === 'number') cls += ' row--number';
+
+    if (r._isButton) cls += ' row--btn';
+    if (r._isTitle) cls += ' row--title';
+    if (r._isLayerRow) cls += ' row--layer';
+    if (r._lockable) cls += ' row--lockable';
+    if (r._nodeRow) cls += ' row--node';
+
+    if (r._domCls) cls += ' ' + r._domCls;
+
+    const valCls = 'row-val' + (hl ? ' row-val--hl' : '');
+    const singleKey = (r.type === 'action' && r.noLR) || r.type === 'nav' || r.type === 'toggle';
+    const skAttr = singleKey ? ' data-single-key="1"' : '';
+    const layerAttr = r._nodeRow ? ' data-is-layer="1"' : '';
+
+    let iconInner = r.icon ? String(r.icon) : '';
+    let iconAttrs = r.iconAttrs || '';
+    let lockHtml = '';
+
+    if (r._lockable) {
+      const n = ecs.nodes[r._ni ?? r.nodeIdx ?? ecs.listCursor];
+      ensureNodeLocks(n);
+      const locked = !!n?.lock?.[r._prop];
+      lockHtml = `<span class="lk ${locked ? 'lk--on' : ''}" data-zone="lock" title="LOCK RAFAŁA">${locked ? 'L' : '&nbsp;'}</span>`;
+    }
+
+    const icon = (iconInner || lockHtml)
+      ? `<span class="row-icon" ${iconAttrs}>${iconInner}${lockHtml}</span>`
+      : '<span class="row-icon"></span>';
+
+    if (r._isLayerRow) {
+      const n = ecs.nodes[r.nodeIdx];
+      const ni = r.nodeIdx;
+      const isVis = n?.active;
+      const rafalOn = n?.props?.rafalEnabled !== false;
+      const visColor = isVis ? 'var(--col-tpx)' : 'var(--txt-mute)';
+      const iconHtml =
+        `<span class="vis-icon" data-vis-idx="${ni}" style="color:${visColor}">✻</span>` +
+        `<span class="lk ${rafalOn ? 'lk--on' : ''}" data-rafal-idx="${ni}" data-zone="lock">L</span>`;
+
+      return `<div class="${cls}"${layerAttr} data-ri="${fi}" style="cursor:pointer">${renderFront(r, fi)}<span class="row-lbl" data-zone="label">${escHtml(n?.name || '')}</span><span class="row-val"></span><span class="row-icon">${iconHtml}</span></div>`;
+    }
+
+    return `<div class="${cls}"${skAttr}${layerAttr} data-ri="${fi}" style="cursor:pointer">${renderFront(r, fi)}<span class="row-lbl" data-zone="label">${escHtml(r.label || '')}</span><span class="${valCls}" data-zone="value">${val}</span>${icon}</div>`;
+  }
+
+  let html = '';
+  let fi = 0;
+  for (const gr of groups) {
+    let ghtml = '';
+    for (const r of gr) {
+      ghtml += renderRow(r, fi);
+      fi++;
+    }
+    html += `<div class="group">${ghtml}</div>`;
+  }
+
+  hud.innerHTML = `<div class="col col--single"><div class="col-scroll">${html}</div></div>`;
+  drawInspect();
+}
+
+
+function renderUI(force = false) {
+  if (force) {
+    TLX_RUNTIME_UI.pending = false;
+    TLX_RUNTIME_UI.lastUiRenderMs = performance.now();
+    tlxConsumeUiDirty();
+    performRenderUI();
+    return;
+  }
+  tlxMarkUiDirty('layout');
+  if (TLX_RUNTIME_UI.pending) return;
+  TLX_RUNTIME_UI.pending = true;
+  requestAnimationFrame(() => {
+    const now = performance.now();
+    const wait = Math.max(0, TLX_RUNTIME_UI.throttleMs - (now - TLX_RUNTIME_UI.lastUiRenderMs));
+    const flush = () => {
+      TLX_RUNTIME_UI.pending = false;
+      TLX_RUNTIME_UI.lastUiRenderMs = performance.now();
+      tlxConsumeUiDirty();
+      performRenderUI();
+    };
+    if (wait <= 0) flush();
+    else setTimeout(flush, wait);
+  });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+
+function drawInspect() {
+  ovCtx.clearRect(0, 0, ov.width, ov.height);
+  if (!state.showGrid) return;  // Inwestygacja toggle controls overlay independently
+
+  // Rotate the entire overlay to match GPU render (sceneRot applied in vertex shaders)
+  const scR = state.sceneRot * Math.PI / 180;
+  if (scR !== 0) {
+    ovCtx.save();
+    ovCtx.translate(ov.width/2, ov.height/2);
+    ovCtx.rotate(scR);
+    ovCtx.translate(-ov.width/2, -ov.height/2);
+  }
+
+  function w2s(wx, wy) {
+    const asp = canvas.width / canvas.height;
+    return [
+      ((wx + state.panX) * state.zoom / asp + 1) / 2 * ov.width,
+      (1 - (wy + state.panY) * state.zoom) / 2 * ov.height
+    ];
+  }
+  function w2sr(r) { return r * state.zoom / (canvas.width/canvas.height) * ov.width / 2; }
+
+  // Draw grid — fixed 0.1 minor / 1.0 major, mid-gray so works on all backgrounds
+  {
+    const asp = canvas.width / canvas.height;
+    // Adaptacyjny grid — step dobiera się do zoom żeby bylo 40-120px między liniami
+    const pxPerUnit = state.zoom / asp * ov.width / 2;
+    const niceSteps = [0.0001,0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100];
+    const MINOR = niceSteps.find(s => s * pxPerUnit >= 20) ?? 100;
+    const MAJOR = niceSteps.find(s => s * pxPerUnit >= 100) ?? 100;
+    const xMin = -state.panX - asp / state.zoom;
+    const xMax = -state.panX + asp / state.zoom;
+    const yMin = -state.panY - 1 / state.zoom;
+    const yMax = -state.panY + 1 / state.zoom;
+
+    ovCtx.save();
+    ovCtx.font = '12px Menlo,monospace';
+
+    // Only draw minor grid when zoomed in enough (avoid clutter)
+    const pxPerMinor = MINOR * state.zoom / asp * ov.width / 2;
+    if (pxPerMinor >= 6) {
+      ovCtx.strokeStyle = 'rgba(128,128,128,0.33)';
+      ovCtx.lineWidth = 0.5;
+      const x0m = Math.floor(xMin / MINOR) * MINOR;
+      for (let xw = x0m; xw <= xMax + MINOR; xw += MINOR) {
+        if (Math.abs(Math.round(xw / MAJOR) * MAJOR - xw) < MINOR * 0.01) continue;
+        const [sx] = w2s(xw, 0);
+        ovCtx.beginPath(); ovCtx.moveTo(sx, 0); ovCtx.lineTo(sx, ov.height); ovCtx.stroke();
+      }
+      const y0m = Math.floor(yMin / MINOR) * MINOR;
+      for (let yw = y0m; yw <= yMax + MINOR; yw += MINOR) {
+        if (Math.abs(Math.round(yw / MAJOR) * MAJOR - yw) < MINOR * 0.01) continue;
+        const [, sy] = w2s(0, yw);
+        ovCtx.beginPath(); ovCtx.moveTo(0, sy); ovCtx.lineTo(ov.width, sy); ovCtx.stroke();
+      }
+    }
+
+    // Major grid (1.0) — mid-gray
+    ovCtx.strokeStyle = 'rgba(128,128,128,0.50)';
+    ovCtx.lineWidth = 1.0;
+    const x0M = Math.floor(xMin / MAJOR) * MAJOR;
+    for (let xw = x0M; xw <= xMax + MAJOR; xw += MAJOR) {
+      if (Math.abs(xw) < MAJOR * 0.01) continue;
+      const [sx] = w2s(xw, 0);
+      ovCtx.beginPath(); ovCtx.moveTo(sx, 0); ovCtx.lineTo(sx, ov.height); ovCtx.stroke();
+    }
+    const y0M = Math.floor(yMin / MAJOR) * MAJOR;
+    for (let yw = y0M; yw <= yMax + MAJOR; yw += MAJOR) {
+      if (Math.abs(yw) < MAJOR * 0.01) continue;
+      const [, sy] = w2s(0, yw);
+      ovCtx.beginPath(); ovCtx.moveTo(0, sy); ovCtx.lineTo(ov.width, sy); ovCtx.stroke();
+    }
+
+    // Axes
+    const [ox, oy] = w2s(0, 0);
+    ovCtx.lineWidth = 1;
+    // X axis (horizontal) — blue
+    ovCtx.strokeStyle = 'rgba(80,140,255,0.55)';
+    ovCtx.beginPath(); ovCtx.moveTo(0, oy); ovCtx.lineTo(ov.width, oy); ovCtx.stroke();
+    // Y axis (vertical) — red
+    ovCtx.strokeStyle = 'rgba(255,80,80,0.55)';
+    ovCtx.beginPath(); ovCtx.moveTo(ox, 0); ovCtx.lineTo(ox, ov.height); ovCtx.stroke();
+
+    // Origin dot — white
+    ovCtx.fillStyle = 'rgba(255,255,255,0.75)';
+    ovCtx.beginPath(); ovCtx.arc(ox, oy, 2.5, 0, Math.PI*2); ovCtx.fill();
+
+    // Unit labels on major grid lines — precyzja zależy od MAJOR
+    const pxPerMajor = MAJOR * state.zoom / asp * ov.width / 2;
+    if (pxPerMajor >= 40) {
+      const dec = MAJOR >= 1 ? 0 : MAJOR >= 0.1 ? 1 : MAJOR >= 0.01 ? 2 : MAJOR >= 0.001 ? 3 : 4;
+      const fmt = v => v.toFixed(dec);
+      ovCtx.fillStyle = 'rgba(128,128,128,0.55)';
+      ovCtx.textAlign = 'center';
+      for (let xw = x0M; xw <= xMax + MAJOR; xw += MAJOR) {
+        if (Math.abs(xw) < MAJOR * 0.01) continue;
+        const [sx] = w2s(xw, 0);
+        ovCtx.fillText(fmt(xw), sx, Math.min(ov.height - 3, Math.max(11, oy - 3)));
+      }
+      ovCtx.textAlign = 'left';
+      for (let yw = y0M; yw <= yMax + MAJOR; yw += MAJOR) {
+        if (Math.abs(yw) < MAJOR * 0.01) continue;
+        const [, sy] = w2s(0, yw);
+        ovCtx.fillText(fmt(yw), Math.min(ov.width - 20, Math.max(2, ox + 3)), sy + 9);
+      }
+    }
+
+    ovCtx.restore();
+  }
+
+  // ── Gradient field temperature overlay ────────────────────────────
+  if (state.fieldStr > 0 && gradCpuData) {
+    // find max magnitude for normalization
+    let maxM = 0.0001;
+    for (let i = 0; i < FIELD_RES * FIELD_RES; i++) {
+      const gx = gradCpuData[i*2], gy = gradCpuData[i*2+1];
+      const m = Math.sqrt(gx*gx + gy*gy);
+      if (m > maxM) maxM = m;
+    }
+    // build ImageData at FIELD_RES native, then scale to canvas — one putImageData + drawImage
+    const imgData = new ImageData(FIELD_RES, FIELD_RES);
+    const d = imgData.data;
+    const fStr = state.fieldStr;
+    for (let gy = 0; gy < FIELD_RES; gy++) {
+      for (let gx = 0; gx < FIELD_RES; gx++) {
+        const idx = gy * FIELD_RES + gx;
+        const vx = gradCpuData[idx*2], vy = gradCpuData[idx*2+1];
+        const mag = Math.sqrt(vx*vx + vy*vy) / maxM;
+        if (mag < 0.008) continue;
+        // hue 200 (blue) → 0 (red), inline HSL≈RGB approximation for speed
+        const hue = (1 - mag) * 200;         // 0..200 deg
+        const h6  = hue / 60;
+        const c   = 0.55 * mag;              // chroma scales with mag (≈ S=1, L=0.55*(mag*0.5+0.275))
+        const x   = c * (1 - Math.abs(h6 % 2 - 1));
+        let r=0, g=0, b=0;
+        if      (h6 < 1) { r=c; g=x; }
+        else if (h6 < 2) { r=x; g=c; }
+        else if (h6 < 3) { g=c; b=x; }
+        else              { g=x; b=c; }
+        const m2 = 0.55 - c * 0.5;
+        // present shader flips y → write to (FIELD_RES-1-gy) row
+        const pi = ((FIELD_RES - 1 - gy) * FIELD_RES + gx) * 4;
+        d[pi]   = (r + m2) * 255 | 0;
+        d[pi+1] = (g + m2) * 255 | 0;
+        d[pi+2] = (b + m2) * 255 | 0;
+        d[pi+3] = mag * 0.38 * fStr * 255 | 0;
+      }
+    }
+    // blit at native FIELD_RES, scale via drawImage — reuse persistent canvas
+    gradTmpCanvas.getContext('2d').putImageData(imgData, 0, 0);
+    ovCtx.drawImage(gradTmpCanvas, 0, 0, ov.width, ov.height);
+
+    // arrow overlay — every 16 cells to keep it readable at 512
+    const ARROW_STEP = 16;
+    ovCtx.save();
+    const cellW = ov.width / FIELD_RES, cellH = ov.height / FIELD_RES;
+    for (let gy = ARROW_STEP/2; gy < FIELD_RES; gy += ARROW_STEP) {
+      for (let gx = ARROW_STEP/2; gx < FIELD_RES; gx += ARROW_STEP) {
+        const vx = gradCpuData[(gy*FIELD_RES+gx)*2];
+        const vy = gradCpuData[(gy*FIELD_RES+gx)*2+1];
+        const mag = Math.sqrt(vx*vx + vy*vy) / maxM;
+        if (mag < 0.05) continue;
+        const cx = (gx + 0.5) * cellW;
+        const cy = (FIELD_RES - 1 - gy + 0.5) * cellH;
+        const len = Math.min(cellW * ARROW_STEP * 0.38, 14) * mag;
+        const angle = Math.atan2(vy, vx);
+        const ex = cx + Math.cos(angle) * len, ey = cy + Math.sin(angle) * len;
+        ovCtx.strokeStyle = `rgba(255,255,255,${(0.45*mag).toFixed(2)})`;
+        ovCtx.lineWidth = 0.8;
+        ovCtx.beginPath(); ovCtx.moveTo(cx, cy); ovCtx.lineTo(ex, ey); ovCtx.stroke();
+      }
+    }
+    ovCtx.restore();
+    // label
+    ovCtx.save();
+    ovCtx.font = '10px Menlo,monospace';
+    ovCtx.fillStyle = 'rgba(200,200,200,0.6)';
+    ovCtx.fillText(`temperatura · pole ${state.fieldStr.toFixed(2)}`, 6, ov.height - 6);
+    ovCtx.restore();
+  }
+
+  ecs.nodes.forEach((n, i) => {
+    if (!n.active) return;
+    const isSel = i === ecs.listCursor;
+    const isDrag = (draggingNode === n);
+    const col = isSel ? '#ef4444' : 'rgba(255,255,255,0.35)';
+    ovCtx.strokeStyle = col; ovCtx.lineWidth = isSel ? 1.5 : 0.75;
+    ovCtx.font = '10px Menlo,monospace'; ovCtx.fillStyle = col;
+
+    // subtle drag highlight (center halo)
+    if (isDrag) {
+      const [hx, hy] = w2s(n.props.x, n.props.y);
+      ovCtx.save();
+      ovCtx.setLineDash([]);
+      ovCtx.lineWidth = 1.0;
+      ovCtx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ovCtx.fillStyle = 'rgba(255,255,255,0.06)';
+      ovCtx.beginPath(); ovCtx.arc(hx, hy, 14, 0, Math.PI * 2); ovCtx.fill(); ovCtx.stroke();
+      ovCtx.restore();
+    }
+
+    // innate limit N-gon overlay (TPX)
+    if (n.type === 'tpx' && (n.props.iShape||0) > 0) {
+      const [cx, cy] = w2s(n.props.x, n.props.y);
+      const r = w2sr(n.props.iLimitA || 0.5);
+      const shape = n.props.iShape;
+      ovCtx.setLineDash([4, 4]);
+      ovCtx.beginPath();
+      if (shape === 1) {
+        ovCtx.arc(cx, cy, r, 0, Math.PI * 2);
+      } else {
+        const N = Math.max(3, shape);
+        const off = (Math.PI * 2) / (2 * N); // align with ngon_sdf (flat side at angle=0)
+        for (let k = 0; k < N; k++) {
+          const a = (k / N) * Math.PI * 2 + off;
+          const px = cx + Math.cos(a) * r, py = cy + Math.sin(a) * r;
+          if (k === 0) ovCtx.moveTo(px, py); else ovCtx.lineTo(px, py);
+        }
+        ovCtx.closePath();
+      }
+      ovCtx.stroke();
+      ovCtx.setLineDash([]);
+    }
+
+    if (n.type === 'tpx') {
+      const [ex,ey] = w2s(n.props.x, n.props.y);
+      const sz = isSel ? 8 : 5;
+      ovCtx.beginPath(); ovCtx.moveTo(ex-sz,ey-sz); ovCtx.lineTo(ex+sz,ey+sz); ovCtx.moveTo(ex+sz,ey-sz); ovCtx.lineTo(ex-sz,ey+sz); ovCtx.stroke();
+      const hRad = n.props.head * Math.PI/180;
+      ovCtx.beginPath(); ovCtx.moveTo(ex,ey); ovCtx.lineTo(ex+Math.cos(hRad)*20, ey-Math.sin(hRad)*20); ovCtx.stroke();
+      if (isSel) ovCtx.fillText(getDisplayId(n)+' '+n.name, ex+10, ey-8);
+    }
+  });
+  if (scR !== 0) ovCtx.restore();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// INPUT
+// ══════════════════════════════════════════════════════════════════════
+
+// Shared action dispatcher — used by keyboard, click, and level-0 shortcuts
+
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function updateMouseWorldFromEvent(e) {
+  const { wx, wy } = clientToWorld(e);
+  state.sim.mouseWX = wx;
+  state.sim.mouseWY = wy;
+}
+
+function isLocalGravMode() {
+  return state.gravMode === 1;
+}
+
+function getSelectedTpx() {
+  const n = ecs.nodes[ecs.listCursor];
+  return (n && n.type === 'tpx') ? n : null;
+}
+
+function pairAllowedByGravMode(a, b, selected) {
+  if (!isLocalGravMode()) return true;
+  return !!selected && (a === selected || b === selected);
+}
+
+function getPairInteraction(a, b, selected) {
+  if (!a || !b || a === b) return { allowed:false, signedForce:0, strength01:0, cadenceFrames:TLX_PHYS.cadenceMaxFrames, dist:0, dx:0, dy:0 };
+  if (!pairAllowedByGravMode(a, b, selected)) return { allowed:false, signedForce:0, strength01:0, cadenceFrames:TLX_PHYS.cadenceMaxFrames, dist:0, dx:0, dy:0 };
+
+  const gravA = Math.abs(a.props.gravStr || 0);
+  const gravB = Math.abs(b.props.gravStr || 0);
+  if (gravA === 0 || gravB === 0) return { allowed:false, signedForce:0, strength01:0, cadenceFrames:TLX_PHYS.cadenceMaxFrames, dist:0, dx:0, dy:0 };
+
+  const relRaw = getRawRelationValue(a, b.id);
+  if (relRaw === 0) return { allowed:false, signedForce:0, strength01:0, cadenceFrames:TLX_PHYS.cadenceMaxFrames, dist:0, dx:0, dy:0 };
+
+  const dx = b.props.x - a.props.x;
+  const dy = b.props.y - a.props.y;
+  const distSq = dx*dx + dy*dy;
+  const dist = Math.sqrt(distSq + 1e-9);
+  const relSign = relRaw < 0 ? -1 : 1;
+  const relMag = getRelationStrengthMagnitude(a, b.id);
+  const baseStrength = gravA * gravB * relMag;
+  const localFactor = isLocalGravMode() ? (1 / (distSq + TLX_PHYS.localDistEps)) : 1;
+  const signedForce = relSign * baseStrength * localFactor;
+  const strength01 = clamp(Math.abs(signedForce), 0, 1);
+  const cadenceDist = isLocalGravMode() ? Math.max(0.001, dist / TLX_PHYS.pairDistUnit) : 1;
+  const cadenceFrames = clamp(Math.round((TLX_PHYS.pairDistUnitFrames * cadenceDist) / Math.max(1, baseStrength)), TLX_PHYS.cadenceMinFrames, TLX_PHYS.cadenceMaxFrames);
+
+  return { allowed:true, relSign, relMag, gravA, gravB, dx, dy, distSq, dist, signedForce, strength01, cadenceFrames };
+}
+
+const ENTROPY_NUMERIC_PROPS = ['words','steps','stepLen','angle','head','alpha','iLimitA'];
+const ENTROPY_LIST_PROPS = ['bits','drawMode','colMode','blend','lod','iShape','iLtype'];
+const ENTROPY_BOOL_PROPS = ['twist','resetH','pulsar'];
+
+function applyAmandaStep(dt) {
+  const nodes = ecs.nodes.filter(n => n.type === 'tpx' && n.active);
+  if (!nodes.length) return false;
+
+  nodes.forEach(ensureNodeDyn);
+
+  const selected = getSelectedTpx();
+  const mouseGrav = state.sim.mouseGrav || 0;
+  const amandaEnabled = !!state.sim.amandaEnabled;
+  const amandaG = state.sim.amandaG || 0;
+  let changed = false;
+
+  for (const n of nodes) {
+    const selfGrav = Math.abs(n.props.gravStr || 0);
+    if (selfGrav === 0) continue;
+
+    let ax = 0;
+    let ay = 0;
+
+    if (amandaEnabled && amandaG !== 0) {
+      for (const other of nodes) {
+        if (other === n) continue;
+        const pair = getPairInteraction(n, other, selected);
+        if (!pair.allowed || pair.signedForce === 0) continue;
+
+        const invR = 1 / Math.max(pair.dist, 1e-6);
+        const distMul = isLocalGravMode() ? invR : 1;
+        const f = pair.signedForce * amandaG * distMul;
+
+        ax += pair.dx * invR * f;
+        ay += pair.dy * invR * f;
+      }
+    }
+
+    if (mouseGrav !== 0) {
+      const allowedByMode = !isLocalGravMode() || selected === n;
+      if (allowedByMode) {
+        const dx = state.sim.mouseWX - n.props.x;
+        const dy = state.sim.mouseWY - n.props.y;
+        const distSq = dx*dx + dy*dy;
+        const dist = Math.sqrt(distSq + 1e-9);
+        const invR = 1 / Math.max(dist, 1e-6);
+        const localFactor = isLocalGravMode() ? (1 / (distSq + TLX_PHYS.mouseDistEps)) : 1;
+        const f = mouseGrav * selfGrav * localFactor;
+
+        ax += dx * invR * f;
+        ay += dy * invR * f;
+      }
+    }
+
+    n.dyn.vx = (n.dyn.vx + ax * dt) * state.sim.damping;
+    n.dyn.vy = (n.dyn.vy + ay * dt) * state.sim.damping;
+
+    n.dyn.vx = clamp(n.dyn.vx, -state.sim.maxVel, state.sim.maxVel);
+    n.dyn.vy = clamp(n.dyn.vy, -state.sim.maxVel, state.sim.maxVel);
+
+    const stepX = clamp(n.dyn.vx * dt, -state.sim.maxStep, state.sim.maxStep);
+    const stepY = clamp(n.dyn.vy * dt, -state.sim.maxStep, state.sim.maxStep);
+
+    if (stepX !== 0 || stepY !== 0) {
+      n.props.x += stepX;
+      n.props.y += stepY;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+function applyStateEntropyStep(dt, stepMs) {
+  if (!state.sim.entropyEnabled || state.sim.entropyG === 0) return false;
+
+  const nodes = ecs.nodes.filter(n => n.type === 'tpx' && n.active);
+  if (nodes.length < 2) return false;
+
+  const selected = getSelectedTpx();
+  const numDelta = new Map();
+  let changed = false;
+
+  const addNumDelta = (n, key, delta) => {
+    if (!numDelta.has(n.id)) numDelta.set(n.id, {});
+    const bucket = numDelta.get(n.id);
+    bucket[key] = (bucket[key] || 0) + delta;
+  };
+
+  for (let i = 0; i < nodes.length; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < nodes.length; j++) {
+      const pair = getPairInteraction(a, nodes[j], selected);
+      if (!pair.allowed || pair.strength01 <= 0) continue;
+
+      const cadenceFrames = pair.cadenceFrames;
+      if ((state.sim.tick % cadenceFrames) !== 0) continue;
+
+      const b = nodes[j];
+      const intervalSec = cadenceFrames / state.sim.fps;
+      const strength = clamp(pair.strength01 * Math.abs(state.sim.entropyG), 0, 1);
+      if (strength <= 0) continue;
+
+      const rateChunk = TLX_PHYS.entropyPerSecond * intervalSec * strength;
+      for (const key of ENTROPY_NUMERIC_PROPS) {
+        const av = +a.props[key];
+        const bv = +b.props[key];
+        if (!Number.isFinite(av) || !Number.isFinite(bv) || av === bv) continue;
+        const delta = (bv - av) * rateChunk;
+        addNumDelta(a, key, +delta);
+        addNumDelta(b, key, -delta);
+      }
+
+      const swapPhase = (Math.floor(state.sim.tick / cadenceFrames) % 2) === 1;
+      for (const key of ENTROPY_LIST_PROPS) {
+        const av = a.props[key];
+        const bv = b.props[key];
+        if (av === undefined || bv === undefined || av === bv) continue;
+        a.props[key] = swapPhase ? bv : av;
+        b.props[key] = swapPhase ? av : bv;
+        changed = true;
+      }
+      for (const key of ENTROPY_BOOL_PROPS) {
+        const av = !!a.props[key];
+        const bv = !!b.props[key];
+        if (av === bv) continue;
+        a.props[key] = swapPhase ? bv : av;
+        b.props[key] = swapPhase ? av : bv;
+        changed = true;
+      }
+    }
+  }
+
+  for (const n of nodes) {
+    const delta = numDelta.get(n.id);
+    if (!delta) continue;
+    for (const key of Object.keys(delta)) {
+      let next = (+n.props[key]) + delta[key];
+      if (key === 'words' || key === 'steps' || key === 'lod') next = Math.max(1, Math.round(next));
+      if (key === 'alpha') next = clamp(next, 0, 1);
+      if (key === 'iLimitA') next = clamp(next, 0, 8);
+      n.props[key] = next;
+      changed = true;
+    }
+    clampWords(n);
+  }
+
+  return changed;
+}
+
+function simLoopActive() {
+  return !!state.sim.amandaEnabled || !!state.sim.entropyEnabled || state.sim.mouseGrav !== 0;
+}
+
+window.addEventListener("keydown", e => {
+  const kRaw = e.key;
+  const k = kRaw.length === 1 ? kRaw.toLowerCase() : kRaw;
+  if (e.target?.tagName === 'INPUT' || e.target?.tagName === 'TEXTAREA') return;
+  // Dyskietka — key handlers (pierwszy który zwróci true pochłania event)
+  for (const kh of _keyHandlers) { if (kh(e)) return; }
+
+  const flat = state.uiFlat || [];
+  const cur  = flat[ecs.ui.cursor];
+
+  // H = hud toggle (always)
+  if (k === 'h') { ACTIONS.hud(); return; }
+
+  // Escape = pop stack (back), or close HUD
+  if (k === 'Escape') {
+    if (ecs.ui.stack.length > 0) {
+      const top = ecs.ui.stack.pop();
+      ecs.ui.cursor = top?._retCursor ?? 0;
+      renderUI();
+    }
+    return;
+  }
+
+  // ↑↓ navigate
+  if (k === 'ArrowUp')   { e.preventDefault(); ecs.ui.cursor = Math.max(0, ecs.ui.cursor-1); renderUI(); return; }
+  if (k === 'ArrowDown') { e.preventDefault(); ecs.ui.cursor = Math.min((state.uiFlat||[]).length-1, ecs.ui.cursor+1); renderUI(); return; }
+
+  // ←→ value change on focused row
+  if (k === 'ArrowLeft' || k === 'ArrowRight') {
+    e.preventDefault();
+    if (cur) handleRow(cur, k==='ArrowRight' ? 1 : -1, false);
+    return;
+  }
+
+  // Enter = activate focused row
+  if (k === 'Enter' || k === ' ') {
+    e.preventDefault();
+    if (cur) handleRow(cur, 0, true);
+    return;
+  }
+
+  // Delete/Backspace on node row = delete node
+  if ((k === 'Delete' || k === 'Backspace') && cur?._nodeRow) {
+    e.preventDefault(); deleteNode(cur.nodeIdx); return;
+  }
+
+  // history: z / x (always)
+  if (k === 'z') { historyStep(-1); return; }
+  if (k === 'x') { historyStep(1);  return; }
+
+  // Hotkey search: find first row in flat that has matching key
+  if (kRaw.length === 1) {
+    const idx = flat.findIndex(r => {
+      const f = rowFront(r);
+      if (f?.type === 'key'  && f.text?.toLowerCase() === k) return true;
+      if (f?.type === 'key2' && (f.texts||[]).some(t => t.toLowerCase() === k)) return true;
+      if (r.key  && r.key.toLowerCase()  === k) return true;
+      if (r.key2 && r.key2.some(t => t.toLowerCase() === k)) return true;
+      return false;
+    });
+    if (idx >= 0) {
+      ecs.ui.cursor = idx;
+      const r = flat[idx];
+      const f = rowFront(r);
+      // key2: decide dir from which key was pressed
+      let dir = 1;
+      if (f?.type === 'key2') dir = (f.texts[0].toLowerCase() === k) ? -1 : 1;
+      if (r.key2?.[0]?.toLowerCase() === k) dir = -1;
+      // Direct hotkey press: force=true for single-key rows (noLR only blocks ←→ arrows)
+      const isKey2 = f?.type==='key2' || r.key2;
+      handleRow(r, dir, !isKey2 && (r.type==='toggle'||r.type==='action'||r.type==='nav'));
+      return;
+    }
+  }
+});
+
+window.addEventListener("keyup", e => {
+  const kRaw = e.key;
+  const k = kRaw.length === 1 ? kRaw.toLowerCase() : kRaw;
+  if (k === 'a') {
+    // hotkey obsługuje sam wiersz UI
+  }
+});
+window.addEventListener("blur", () => {
+  state.sim.accMs = 0;
+});
+
+// HUD mouse events (delegation)
+hud.addEventListener('pointerdown', e => {
+  e.stopPropagation();
+
+  // Vis toggle on layer row (✻)
+  const visEl = e.target.closest('[data-vis-idx]');
+  if (visEl) {
+    snapshot();
+    const ni = +visEl.dataset.visIdx;
+    ecs.listCursor = ni;
+    ecs.nodes[ni].active = !ecs.nodes[ni].active;
+    syncECS(true); renderUI(); return;
+  }
+  // Rafał lock toggle on layer row (L)
+  const rafalEl = e.target.closest('[data-rafal-idx]');
+  if (rafalEl) {
+    snapshot();
+    const ni = +rafalEl.dataset.rafalIdx;
+    const n = ecs.nodes[ni];
+    if (n) n.props.rafalEnabled = n.props.rafalEnabled === false ? true : false;
+    renderUI(); return;
+  }
+
+  const rowEl = e.target.closest('[data-ri]');
+  if (!rowEl) return;
+  const ri = +rowEl.dataset.ri;
+  const flat = state.uiFlat || [];
+  const r = flat[ri];
+  if (!r) return;
+
+  // Determine click zone
+  const zoneEl = e.target.closest('[data-zone]');
+  const zone   = zoneEl?.dataset.zone ?? 'label';  // default: label
+
+  // Zone: lock (LOCK RAFAŁA) — do not trigger row action
+  if (zone === 'lock') {
+    ecs.ui.cursor = ri;
+    const n = ecs.nodes[r._ni ?? r.nodeIdx ?? ecs.listCursor];
+    if (n && r._prop) { toggleLock(n, r._prop); }
+    renderUI();
+    return;
+  }
+
+  // Zone: label → focus; button rows and nav-label rows also activate
+  if (zone === 'label') {
+    ecs.ui.cursor = ri;
+    if (r._isButton || r.type === 'nav') { handleRow(r, 0, true); return; }
+    renderUI(); return;
+  }
+
+  // Zone: key → simulate key press for this row
+  if (zone === 'key') {
+    ecs.ui.cursor = ri;
+    const keyText  = zoneEl.dataset.key  ?? '';
+    const dirAttr  = zoneEl.dataset.dir;
+    // dir: explicit from data-dir (key2), else: for number/list key2 first=-1 second=+1
+    let dir = dirAttr !== undefined ? +dirAttr : 1;
+    // For key2 rows without explicit data-dir: first key = -1
+    if (!dirAttr && r.key2) {
+      dir = (r.key2[0]?.toLowerCase() === keyText) ? -1 : 1;
+    }
+    const force = (r.type==='toggle'||r.type==='action'||r.type==='nav');
+    handleRow(r, dir, force);
+    return;
+  }
+
+  // Zone: value → like Enter
+  ecs.ui.cursor = ri;
+  if (r.type === 'toggle' || r.type === 'action' || r.type === 'nav') {
+    handleRow(r, 0, true); return;
+  }
+  if (r.type === 'list') {
+    handleRow(r, 1, false); return;
+  }
+  if (r.type === 'number') {
+    // value click: right half=+1, left half=-1
+    const rect = (e.target.closest('[data-zone="value"]') || rowEl).getBoundingClientRect();
+    const dir = e.clientX > rect.left + rect.width * 0.5 ? 1 : -1;
+    handleRow(r, dir, false); return;
+  }
+  renderUI();
+});
+
+// Canvas interaction
+let draggingNode = null, isPanning = false, lastX = 0, lastY = 0;
+const SNAP_STEP = 0.1;
+
+function clientToWorld(e) {
+  const rect = canvas.getBoundingClientRect();
+  const nx = (e.clientX - rect.left) / rect.width * 2 - 1;
+  const ny = 1 - (e.clientY - rect.top) / rect.height * 2;
+  const asp = canvas.width / canvas.height;
+  let wx = (nx * asp) / state.zoom - state.panX;
+  let wy = (ny) / state.zoom - state.panY;
+  if (e.shiftKey) {
+    wx = Math.round(wx / SNAP_STEP) * SNAP_STEP;
+    wy = Math.round(wy / SNAP_STEP) * SNAP_STEP;
+  }
+  return { wx, wy };
+}
+
+canvas.addEventListener("pointerdown", e => {
+  if (e.target.closest('.hud')) return;
+  updateMouseWorldFromEvent(e);
+  lastX = e.clientX; lastY = e.clientY;
+
+  if (e.button === 1) { // middle mouse → pan
+    isPanning = true;
+    canvas.style.cursor = 'grab';
+    e.preventDefault();
+    return;
+  }
+
+  // LMB: move + drag active node (focused layer)
+  if (e.button === 0) {
+    const selNode = ecs.nodes[ecs.listCursor];
+    if (selNode && NODE_PROPS[selNode.type]?.includes('x')) {
+      draggingNode = selNode;
+      const { wx, wy } = clientToWorld(e);
+
+      snapshot(); // obeys saveHistory toggle (manual snap still works elsewhere)
+      selNode.props.x = wx;
+      selNode.props.y = wy;
+
+      syncECS(true);
+      renderUI();
+      drawInspect(); // immediate feedback (highlight + limits)
+      e.preventDefault();
+      return;
+    }
+  }
+});
+
+window.addEventListener("pointerup", e => {
+  draggingNode = null;
+  if (isPanning) { isPanning=false; canvas.style.cursor='crosshair'; }
+  drawInspect();
+});
+
+canvas.addEventListener("pointermove", e => {
+  updateMouseWorldFromEvent(e);
+  if (isPanning) {
+    const asp = canvas.width / canvas.height;
+    state.panX += (e.clientX - lastX) * 2 * asp / (canvas.clientWidth * state.zoom);
+    state.panY -= (e.clientY - lastY) * 2 / (canvas.clientHeight * state.zoom);
+    lastX = e.clientX; lastY = e.clientY;
+    syncECS(false);
+    // overlay must follow camera during pan
+    drawInspect();
+    return;
+  }
+
+  if (draggingNode && (e.buttons & 1)) {
+    const { wx, wy } = clientToWorld(e);
+    draggingNode.props.x = wx;
+    draggingNode.props.y = wy;
+    syncECS(true);
+    renderUI();
+    drawInspect();
+  }
+
+  lastX = e.clientX; lastY = e.clientY;
+});
+
+canvas.addEventListener("wheel", e => {
+  if (e.target.closest('.hud')) return;
+  e.preventDefault();
+  state.zoom = Math.max(0.01, Math.min(20000, state.zoom * Math.exp(-e.deltaY*0.001)));
+  syncECS(false); renderUI();
+}, { passive:false });
+
+// ══════════════════════════════════════════════════════════════════════
+// GPU RESOURCE MANAGEMENT
+// reinitGPU(newMaxPts) — recompiles shaders, reallocates buffers
+// Called on startup and when user changes pts/channel preset
+// ══════════════════════════════════════════════════════════════════════
+let posBuf, cpuBitsBuf, cpuBitsArr;
+let cMod, rMod, pMod, cPipe;
+let fGradPipe, fGradBG, gradBuf, gradReadBuf; // gradient field pass
+let gradCpuData = null; // last readback Float32Array (FIELD_RES*FIELD_RES*2)
+const gradTmpCanvas = document.createElement('canvas'); // reused for ImageData blit
+gradTmpCanvas.width = gradTmpCanvas.height = FIELD_RES;
+let rPipeL_Alpha, rPipeL_Add, rPipeP_Alpha, rPipeP_Add, pPipe;
+let rPipePlus_Alpha, rPipePlus_Add, rPipeZO_Alpha, rPipeZO_Add;
+// Multiply, Screen, Min, Max pipelines per draw mode (indexed [drawMode][blendIdx 2..5])
+let rPipesExt = {}; // key: `${drawMode}_${blendIdx}`
+let cBG, rBGL_Alpha, rBGL_Add, rBGP_Alpha, rBGP_Add;
+let rBGPlus_Alpha, rBGPlus_Add, rBGZO_Alpha, rBGZO_Add;
+let rBGsExt = {}; // key: `${drawMode}_${blendIdx}`
+let accTex, accView;
+const accSamp    = device.createSampler({magFilter:'linear',minFilter:'linear'});
+const UBUF_SIZE  = 16384; 
+const uniBuf     = device.createBuffer({size:UBUF_SIZE, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+const presUniBuf = device.createBuffer({size:48,   usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+let pBG;
+const uArr = new Float32Array(UBUF_SIZE/4);
+const pArr = new Float32Array(12);
+
+function recreateAcc() {
+  if (accTex) accTex.destroy();
+  accTex = device.createTexture({size:[Math.max(1,canvas.width),Math.max(1,canvas.height)], format,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC});
+  accView = accTex.createView();
+  state.accClear = true;
+  if (fGradPipe) buildFieldBindGroup();
+}
+
+function updatePres() {
+  pBG = device.createBindGroup({layout:pPipe.getBindGroupLayout(0),
+    entries:[{binding:0,resource:accSamp},{binding:1,resource:accView},{binding:2,resource:{buffer:presUniBuf}}]});
+}
+
+function buildShaderPipelines() {
+  const MP  = MAX_PTS;
+  const MPU = Math.ceil(MAX_PTS / 32);
+  const R_VECS = Math.ceil(MAX_CH / 4); // <--- DODAJ TO (liczy ile wektorów potrzebujemy na relacje)
+
+  const structs = `
+struct Trk{g:vec4<f32>,f:vec4<f32>,s:vec4<f32>,b:vec4<f32>,pc:vec4<f32>,pd:vec4<f32>,h0:vec4<f32>,h1:vec4<f32>,h2:vec4<f32>,rels:array<vec4<f32>,${R_VECS}>};
+struct Limit{d0:vec4<f32>,d1:vec4<f32>};
+struct Glob{g1:vec4<f32>,g2:vec4<f32>,g3:vec4<f32>,g4:vec4<f32>,gr:array<vec4<f32>,${MAX_CH}>,lm:array<Limit,${MAX_CH * 2}>,tr:array<Trk,${MAX_CH}>};
+fn uhash(x:u32)->u32{var y=x;y^=y>>16u;y*=0x7feb352du;y^=y>>15u;y*=0x846ca68bu;y^=y>>16u;return y;}
+fn rnd(w:u32,i:u32,s:u32)->f32{return f32(uhash(s^(w*0x9e3779b9u)^(i*0x85ebca6bu))&1u);}
+fn ngon_sdf(p:vec2<f32>,n:u32,r:f32)->f32{
+  // signed distance to regular N-gon (positive = outside)
+  let a=6.28318530718/f32(n);let hp=atan2(p.y,p.x);
+  let sector=floor(hp/a+0.5);let ang=sector*a;
+  let c=cos(ang);let s2=sin(ang);let lp=vec2<f32>(p.x*c+p.y*s2,-p.x*s2+p.y*c);
+  return lp.x-r*cos(3.14159265359/f32(n));
+}
+fn ngon_reflect(rel:vec2<f32>,n_sides:u32,r:f32)->vec2<f32>{
+  // reflect rel position off nearest edge of regular N-gon
+  let a=6.28318530718/f32(n_sides);let hp=atan2(rel.y,rel.x);
+  let sector=floor(hp/a+0.5);let ang=sector*a;
+  let c=cos(ang);let s2=sin(ang);
+  let lp=vec2<f32>(rel.x*c+rel.y*s2,-rel.x*s2+rel.y*c);
+  let edge_x=r*cos(3.14159265359/f32(n_sides));
+  let lp_ref=vec2<f32>(2.0*edge_x-lp.x,lp.y);
+  // rotate back
+  return vec2<f32>(lp_ref.x*c-lp_ref.y*s2,lp_ref.x*s2+lp_ref.y*c);
+}`;
+
+  const comp = structs + `
+@group(0) @binding(0) var<uniform> P:Glob;
+@group(0) @binding(1) var<storage,read_write> pos:array<vec4<f32>>;
+@group(0) @binding(2) var<storage,read> cpuBits:array<u32>;
+@group(0) @binding(3) var<storage,read> gradField:array<vec2<f32>>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id:vec3<u32>){
+  let tIdx=id.y;let localWord=id.x;if(tIdx>=${MAX_CH}u){return;}
+  let T=P.tr[tIdx];if(T.g.w<0.5){return;}
+  let baseWord=u32(P.g2.w);let word=baseWord+localWord;
+  let steps=u32(T.g.z);let seed=u32(T.s.y);
+  let start_idx=word*steps;if(start_idx+steps>${MP}u){return;}
+  var p=T.b.zw;var head=T.h0.w;
+  if(u32(T.f.y)==0u){head+=(f32(word)/T.g.w)*6.2831853;}
+  if(T.f.z>0.5&&(word&1u)==1u){head+=3.14159265;}
+  var l=uhash(seed^(word*0x9e3779b9u))|1u;var g=uhash(seed^(word*0x85ebca6bu)^0xA5A5A5A5u)|1u;
+  let base=tIdx*${MP}u+start_idx;pos[base]=vec4<f32>(p,0.0,0.0);
+  var volt=0.0; var spin=0.0;
+  for(var i=1u;i<steps;i++){
+    var bit=0.0;
+    if(u32(T.s.x)==0u){bit=rnd(word,i,seed);}
+    else if(u32(T.s.x)==1u){bit=select(0.0,1.0,(i%3u)==0u);}
+    else if(u32(T.s.x)==2u){let b=l&1u;l=(l>>1u)^(0xB4BCD35Cu*b);let b2=g&1u;g=(g>>1u)^(0x7A5BC2E3u*b2);bit=f32((l^g)&1u);}
+    else if(u32(T.s.x)==3u){let bi=localWord*steps+i;let wi=tIdx*${MPU}u+(bi/32u);bit=f32((cpuBits[wi]>>(bi%32u))&1u);}
+    else if(u32(T.s.x)==5u){bit=1.0;}else if(u32(T.s.x)==6u){bit=select(0.0,1.0,(i%2u)==0u);}
+    // type 7 = PI: also reads cpuBits (packed on CPU by PIGenerator, same slot as TPX)
+    else if(u32(T.s.x)==7u){let bi=localWord*steps+i;let wi=tIdx*${MPU}u+(bi/32u);bit=f32((cpuBits[wi]>>(bi%32u))&1u);}
+    // type 8 = Harmonik: bit from sign of sin — each word is a harmonic (word+1 × fundamental)
+    else if(u32(T.s.x)==8u){let freq=6.2831853*f32(word+1u)/f32(max(1u,steps));bit=select(0.0,1.0,sin(f32(i)*freq)>=0.0);}
+    volt+=select(-1.0,1.0,bit>0.5);
+    let turn=select(-T.g.x,T.g.x,bit>0.5);
+    if(u32(T.f.x)!=0u){spin+=turn;head+=spin;}else{head+=turn;}
+    for(var j=0u;j<${MAX_CH}u;j++){
+      if(P.gr[j].z<0.5){continue;}
+      let rel = T.rels[j / 4u][j % 4u];
+      if(abs(rel)<0.00001){continue;}
+      
+      let d = P.gr[j].xy - p;
+      let distSq = dot(d, d);
+      
+      if(distSq > 0.0001){
+        var dif = atan2(d.y, d.x) - head;
+        dif -= 6.2831853 * floor(dif / 6.2831853 + 0.5);
+        
+        let force = P.gr[j].w * rel;
+        
+        if (P.g4.y > 0.5) {
+          // LOKALNA (Kwadratowa, 1/d^2)
+          // Dodajemy +0.05 w mianowniku jako "bufor" (softening), żeby promień
+          // nie wystrzelił w kosmos (dzielenie przez zero), gdy wpadnie w sam środek węzła.
+          head += dif * (force / (distSq + 0.05));
+        } else {
+          // GLOBALNA (Kierunkowa, niezależna od odległości)
+          head += dif * force;
+        }
+      }
+    }
+    let fStr=P.g4.x;
+    if(fStr>0.0001){
+      let pu=clamp((p.x+P.g1.x)*P.g1.z/P.g1.w*0.5+0.5,0.0,1.0);
+      let pv=clamp(0.5+(p.y+P.g1.y)*P.g1.z*0.5,0.0,1.0);
+      let gx=u32(pu*f32(${FIELD_RES}u));let gy=u32(pv*f32(${FIELD_RES}u));
+      let gxi=min(gx,${FIELD_RES}u-1u);let gyi=min(gy,${FIELD_RES}u-1u);
+      let gv=gradField[gyi*${FIELD_RES}u+gxi];
+      let glen=length(gv);
+      if(glen>0.001){
+        var gAngle=atan2(-gv.y,gv.x);
+        var fdif=gAngle-head;fdif-=6.2831853*floor(fdif/6.2831853+0.5);
+        head+=fdif*fStr;
+      }
+    }
+    let old_p=p;p+=vec2<f32>(cos(head),sin(head))*T.g.y;
+    // lm[0..MAX_CH-1]=TPX innate, lm[MAX_CH*2-1]=Rama
+    for(var k=0u;k<${MAX_CH * 2}u;k++){
+      let L0=P.lm[k].d0;let L1=P.lm[k].d1;
+      let shp=u32(L0.x);let typ=u32(L0.y);if(shp==0u||typ==0u){continue;}
+      let R=L0.z;let center=L1.xy;
+      let rel_old=old_p-center;var new_rel=p-center;var hit=false;
+      // shp 1=koło, 3+= N-gon (N=shp), 2=linia(TODO), 4=kwadrat(N=4 special)
+      if(shp==1u){
+        // circle
+        let d_old=length(rel_old);let d_new=length(new_rel);
+        if((d_old-R)*(d_new-R)<0.0){hit=true;if(typ==1u){new_rel=(new_rel/max(0.0001,d_new))*(2.0*R-d_new);}}
+      } else if(shp==255u){
+        // AABB (used for Rama/viewport)
+        let W=R;let H=L0.w;
+        var dx=new_rel.x-rel_old.x;if(abs(dx)<0.000001){dx=select(-0.000001,0.000001,dx>=0.0);}
+        var dy=new_rel.y-rel_old.y;if(abs(dy)<0.000001){dy=select(-0.000001,0.000001,dy>=0.0);}
+        if((rel_old.x-W)*(new_rel.x-W)<0.0){let t=(W-rel_old.x)/dx;if(abs(rel_old.y+t*dy)<=H){new_rel.x=2.0*W-new_rel.x;hit=true;}}
+        else if((rel_old.x+W)*(new_rel.x+W)<0.0){let t=(-W-rel_old.x)/dx;if(abs(rel_old.y+t*dy)<=H){new_rel.x=-2.0*W-new_rel.x;hit=true;}}
+        if((rel_old.y-H)*(new_rel.y-H)<0.0){let t=(H-rel_old.y)/dy;if(abs(rel_old.x+t*dx)<=W){new_rel.y=2.0*H-new_rel.y;hit=true;}}
+        else if((rel_old.y+H)*(new_rel.y+H)<0.0){let t=(-H-rel_old.y)/dy;if(abs(rel_old.x+t*dx)<=W){new_rel.y=-2.0*H-new_rel.y;hit=true;}}
+      } else {
+        // N-gon: shp==4 → square (special AABB for Rama), shp>=3 → regular polygon
+        var n_sides=shp;
+        let sdf_old=ngon_sdf(rel_old,n_sides,R);
+        let sdf_new=ngon_sdf(new_rel,n_sides,R);
+        if(sdf_old*sdf_new<0.0){
+          hit=true;
+          if(typ==1u){new_rel=ngon_reflect(new_rel,n_sides,R);}
+        }
+      }
+      if(hit){if(typ==2u){p=center;}else{p=center+new_rel;}}
+    }
+    pos[base+i]=vec4<f32>(p,bit,volt);
+  }
+}`;
+
+  const rend = structs + `
+@group(0) @binding(0) var<uniform> P:Glob;
+@group(0) @binding(1) var<storage,read> pos:array<vec4<f32>>;
+struct VOut{@builtin(position) p:vec4<f32>,@location(0) c:vec4<f32>};
+struct Inst{@builtin(instance_index) id:u32};
+fn hsl2rgb(h:f32,s:f32,l:f32)->vec3<f32>{let c=(1.0-abs(2.0*l-1.0))*s;let hp=h/60.0;let x=c*(1.0-abs(fract(hp*0.5)*2.0-1.0));var r=0.0;var g=0.0;var b=0.0;if(hp<1.0){r=c;g=x;}else if(hp<2.0){r=x;g=c;}else if(hp<3.0){g=c;b=x;}else if(hp<4.0){g=x;b=c;}else if(hp<5.0){r=x;b=c;}else{r=c;b=x;}let m=l-c*0.5;return vec3<f32>(r+m,g+m,b+m);}
+fn opc(T:Trk,cm:u32,bit:f32,volt:f32,sf:f32,word:u32)->vec3<f32>{
+  let st=max(1.0,sf);let v=clamp(volt/st,-1.0,1.0);let a=abs(v);let tW=f32(word)/max(1.0,T.g.w-1.0);
+  if(cm==0u){if(a<0.0005){return vec3<f32>(1.0);}let lw=0.31-a*0.31;return select(vec3<f32>(lw,lw,1.0),vec3<f32>(1.0,lw,lw),v>0.0);}
+  if(cm==1u){return clamp(vec3<f32>(0.5)+vec3<f32>(0.5)*cos(6.283185*(T.pc.xyz*(tW+bit*0.15)+T.pd.xyz)),vec3<f32>(0.0),vec3<f32>(1.0))*(0.85+0.25*bit);}
+  if(cm==2u){return vec3<f32>(1.0-a*0.78);}
+  if(cm==3u){return vec3<f32>(clamp((volt+st)*0.5,0.0,st)/st);}
+  if(cm==4u){return vec3<f32>(f32(u32(clamp((volt+st)*0.5,0.0,st))&1u));}
+  if(cm==5u){return hsl2rgb(tW*360.0,1.0,0.5);}
+  if(cm==6u){let ph=tW*6.2831853;return vec3<f32>(0.5+0.5*sin(ph),0.5+0.5*sin(ph+2.094),0.5+0.5*sin(ph+4.189));}
+  if(cm==7u){return vec3<f32>(select(0.0,1.0,bit>0.5));}if(cm==8u){return vec3<f32>(select(1.0,0.0,bit>0.5));}
+  let u=tW;let m=smoothstep(0.0,1.0,u);return mix(mix(T.h0.xyz,T.h1.xyz,smoothstep(0.0,0.5,m)),T.h2.xyz,smoothstep(0.5,1.0,m))*(0.85+0.25*bit);
+}
+fn gcol(T:Trk,word:u32,p:vec4<f32>)->vec4<f32>{
+  let cm=u32(T.s.z);
+  if(cm==10u){return vec4<f32>(p.x*0.5+0.5,p.y*0.5+0.5,select(0.0,1.0,p.z>0.5),T.s.w);}
+  return vec4<f32>(opc(T,cm,p.z,p.w,T.g.z,word),T.s.w);}
+@vertex fn vs_ln(@builtin(vertex_index) vid:u32,i:Inst)->VOut{
+  let T=P.tr[i.id];if(T.g.w<0.5){return VOut(vec4(0.0),vec4(0.0));}
+  let lod=u32(T.h1.w);let stride=max(1u,lod);let sP=max(0u,u32(T.g.z)-1u);
+  let drawnSeg=vid/2u;let end=vid%2u;var safeSeg=drawnSeg*stride;
+  if(lod>=10u){let w=min(drawnSeg,max(0u,u32(T.g.w)-1u));safeSeg=w*sP+max(0u,sP-1u);}
+  let w=safeSeg/max(1u,sP);let s=safeSeg%max(1u,sP);
+  let idx=i.id*${MP}u+w*u32(T.g.z)+s+end;let p=pos[idx];
+  var xy=(p.xy+P.g1.xy)*P.g1.z;xy.x/=P.g1.w;xy.y=-xy.y;
+  let sr=sin(P.g3.w);let cr=cos(P.g3.w);xy=vec2<f32>(xy.x*cr-xy.y*sr,xy.x*sr+xy.y*cr);
+  return VOut(vec4<f32>(xy,0.0,1.0),gcol(T,w,p));}
+@vertex fn vs_pt(@builtin(vertex_index) vid:u32,i:Inst)->VOut{
+  let T=P.tr[i.id];if(T.g.w<0.5){return VOut(vec4(0.0),vec4(0.0));}
+  let lod=u32(T.h1.w);let stride=max(1u,lod);var localIdx=vid*stride;
+  if(lod>=10u){let w=min(vid,max(0u,u32(T.g.w)-1u));localIdx=w*u32(T.g.z)+max(0u,u32(T.g.z)-1u);}
+  let idx=i.id*${MP}u+localIdx;let p=pos[idx];
+  var xy=(p.xy+P.g1.xy)*P.g1.z;xy.x/=P.g1.w;xy.y=-xy.y;
+  let sr2=sin(P.g3.w);let cr2=cos(P.g3.w);xy=vec2<f32>(xy.x*cr2-xy.y*sr2,xy.x*sr2+xy.y*cr2);
+  let w=localIdx/max(1u,u32(T.g.z));
+  return VOut(vec4<f32>(xy,0.0,1.0),gcol(T,w,p));}
+// vs_plus: 4 verts/point, line-list → bit=1: plus(+), bit=0: minus(−)
+// verts 0,1 = horizontal bar; verts 2,3 = vertical (degenerate copy of horiz when bit=0)
+@vertex fn vs_plus(@builtin(vertex_index) vid:u32,i:Inst)->VOut{
+  let T=P.tr[i.id];if(T.g.w<0.5){return VOut(vec4(0.0),vec4(0.0));}
+  let lod=u32(T.h1.w);let stride=max(1u,lod);
+  let ptIdx=vid/4u;let localIdx=ptIdx*stride;
+  let idx=i.id*${MP}u+localIdx;let p=pos[idx];
+  var xy=(p.xy+P.g1.xy)*P.g1.z;xy.x/=P.g1.w;xy.y=-xy.y;
+  let sr=sin(P.g3.w);let cr=cos(P.g3.w);xy=vec2<f32>(xy.x*cr-xy.y*sr,xy.x*sr+xy.y*cr);
+  let sz=0.008;let szx=sz/P.g1.w;
+  let arm=vid%4u;var off=vec2<f32>(0.0,0.0);
+  if(arm==0u){off=vec2<f32>(-szx,0.0);}else if(arm==1u){off=vec2<f32>(szx,0.0);}
+  else if(arm==2u){off=select(vec2<f32>(0.0,0.0),vec2<f32>(0.0,-sz),p.z>0.5);}
+  else{off=select(vec2<f32>(0.0,0.0),vec2<f32>(0.0,sz),p.z>0.5);}
+  let w=localIdx/max(1u,u32(T.g.z));
+  return VOut(vec4<f32>(xy+off,0.0,1.0),gcol(T,w,p));}
+// vs_zo: 16 verts/point, line-list → bit=0: circle (8 segs), bit=1: vertical line (rest degenerate)
+@vertex fn vs_zo(@builtin(vertex_index) vid:u32,i:Inst)->VOut{
+  let T=P.tr[i.id];if(T.g.w<0.5){return VOut(vec4(0.0),vec4(0.0));}
+  let lod=u32(T.h1.w);let stride=max(1u,lod);
+  let ptIdx=vid/16u;let localIdx=ptIdx*stride;
+  let idx=i.id*${MP}u+localIdx;let p=pos[idx];
+  var xy=(p.xy+P.g1.xy)*P.g1.z;xy.x/=P.g1.w;xy.y=-xy.y;
+  let sr=sin(P.g3.w);let cr=cos(P.g3.w);xy=vec2<f32>(xy.x*cr-xy.y*sr,xy.x*sr+xy.y*cr);
+  let sz=0.008;let szx=sz/P.g1.w;
+  let vl=vid%16u;var off=vec2<f32>(0.0,0.0);
+  if(p.z>0.5){if(vl==0u){off=vec2<f32>(0.0,-sz);}else if(vl==1u){off=vec2<f32>(0.0,sz);}}
+  else{let seg=vl/2u;let isEnd=(vl%2u)==1u;let a=f32(seg)*0.7853982+select(0.0,0.7853982,isEnd);off=vec2<f32>(cos(a)*szx,sin(a)*sz);}
+  let w=localIdx/max(1u,u32(T.g.z));
+  return VOut(vec4<f32>(xy+off,0.0,1.0),gcol(T,w,p));}
+@fragment fn fs(in:VOut)->@location(0) vec4<f32>{return in.c;}`;
+
+  const pres = `
+@group(0) @binding(0) var s:sampler;@group(0) @binding(1) var t:texture_2d<f32>;
+struct Uni{mode:vec4<f32>,col:vec4<f32>,asp:vec4<f32>};@group(0) @binding(2) var<uniform> U:Uni;
+struct VOut{@builtin(position) p:vec4<f32>,@location(0) uv:vec4<f32>};
+@vertex fn vs(@builtin(vertex_index) i:u32)->VOut{var p=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return VOut(vec4<f32>(p[i],0.0,1.0),vec4<f32>(p[i]*0.5+0.5,0.0,0.0));}
+@fragment fn fs(in:VOut)->@location(0) vec4<f32>{
+  var uv=in.uv.xy;let mirr=u32(U.asp.y);
+  if(mirr==1u){uv.x=select(uv.x,1.0-uv.x,uv.x>0.5);}
+  else if(mirr==2u){uv.x=select(uv.x,1.0-uv.x,uv.x>0.5);uv.y=select(uv.y,1.0-uv.y,uv.y>0.5);}
+  else if(mirr==3u){uv.x=select(uv.x,1.0-uv.x,uv.x>0.5);uv.y=select(uv.y,1.0-uv.y,uv.y>0.5);if(uv.x>uv.y){let tmp=uv.x;uv.x=uv.y;uv.y=tmp;}}
+  let fg=textureSample(t,s,uv);var bg=vec3<f32>(0.0);let m=u32(U.mode.x);
+  if(m==1u){bg=vec3<f32>(1.0);}
+  else if(m==3u){bg=U.col.xyz;}
+  if(m==2u){return fg;}return vec4<f32>(fg.rgb+bg*(1.0-clamp(fg.a,0.0,1.0)),1.0);}`;
+
+  cMod = device.createShaderModule({code:comp});
+  rMod = device.createShaderModule({code:rend});
+  pMod = device.createShaderModule({code:pres});
+  cPipe = device.createComputePipeline({layout:'auto', compute:{module:cMod,entryPoint:'main'}});
+
+  // ── Gradient field pass ─────────────────────────────────────────────
+  const fGrad = `
+@group(0) @binding(0) var acc:texture_2d<f32>;
+@group(0) @binding(1) var<storage,read_write> grad:array<vec2<f32>>;
+fn lum(c:vec4<f32>)->f32{return dot(c.rgb,vec3<f32>(0.299,0.587,0.114));}
+fn smp(px:i32,py:i32,dim:vec2<i32>)->f32{
+  return lum(textureLoad(acc,vec2<i32>(clamp(px,0,dim.x-1),clamp(py,0,dim.y-1)),0));
+}
+@compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) id:vec3<u32>){
+  let gx=id.x;let gy=id.y;
+  if(gx>=${FIELD_RES}u||gy>=${FIELD_RES}u){return;}
+  let dim=vec2<i32>(textureDimensions(acc));
+  let cx=i32(gx)*dim.x/i32(${FIELD_RES});let cy=i32(gy)*dim.y/i32(${FIELD_RES});
+  let p00=smp(cx-1,cy-1,dim);let p10=smp(cx,cy-1,dim);let p20=smp(cx+1,cy-1,dim);
+  let p01=smp(cx-1,cy,  dim);                          let p21=smp(cx+1,cy,  dim);
+  let p02=smp(cx-1,cy+1,dim);let p12=smp(cx,cy+1,dim);let p22=smp(cx+1,cy+1,dim);
+  let gvx= -p00+p20 + (-2.0*p01+2.0*p21) + -p02+p22;
+  let gvy= -p00-2.0*p10-p20 + p02+2.0*p12+p22;
+  grad[gy*${FIELD_RES}u+gx]=vec2<f32>(gvx,gvy);
+}`;
+  fGradPipe = device.createComputePipeline({layout:'auto', compute:{module:device.createShaderModule({code:fGrad}),entryPoint:'main'}});
+
+  // blendDesc(blendIdx) → {color, alpha} blend descriptors
+  function blendDesc(bi) {
+    switch(bi) {
+      case 0: return { // Alfa
+        color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},
+        alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}};
+      case 1: return { // Add
+        color:{srcFactor:'src-alpha',dstFactor:'one',operation:'add'},
+        alpha:{srcFactor:'one',dstFactor:'one',operation:'add'}};
+      case 2: return { // Multiply (dst*src ≈ zero+dst*src)
+        color:{srcFactor:'dst',dstFactor:'zero',operation:'add'},
+        alpha:{srcFactor:'one',dstFactor:'zero',operation:'add'}};
+      case 3: return { // Screen (1-(1-s)(1-d))
+        color:{srcFactor:'one',dstFactor:'one-minus-src',operation:'add'},
+        alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}};
+      case 4: return { // Min
+        color:{srcFactor:'one',dstFactor:'one',operation:'min'},
+        alpha:{srcFactor:'one',dstFactor:'one',operation:'min'}};
+      default: return { // Max
+        color:{srcFactor:'one',dstFactor:'one',operation:'max'},
+        alpha:{srcFactor:'one',dstFactor:'one',operation:'max'}};
+    }
+  }
+  // mkRPblend(entryPoint, topology, blendIdx) → pipeline
+  function mkRPblend(entryPoint, topology, bi) {
+    return device.createRenderPipeline({
+      layout:'auto',
+      vertex:{module:rMod, entryPoint},
+      fragment:{module:rMod, entryPoint:'fs', targets:[{format, blend:blendDesc(bi)}]},
+      primitive:{topology}
+    });
+  }
+  rPipeL_Alpha   = mkRPblend('vs_ln',   'line-list',  0);
+  rPipeL_Add     = mkRPblend('vs_ln',   'line-list',  1);
+  rPipeP_Alpha   = mkRPblend('vs_pt',   'point-list', 0);
+  rPipeP_Add     = mkRPblend('vs_pt',   'point-list', 1);
+  rPipePlus_Alpha= mkRPblend('vs_plus', 'line-list',  0);
+  rPipePlus_Add  = mkRPblend('vs_plus', 'line-list',  1);
+  rPipeZO_Alpha  = mkRPblend('vs_zo',   'line-list',  0);
+  rPipeZO_Add    = mkRPblend('vs_zo',   'line-list',  1);
+  // Extended blend modes (Multiply/Screen/Min/Max) for all 4 draw modes
+  const _dmDefs = [
+    ['vs_ln','line-list'], ['vs_pt','point-list'], ['vs_plus','line-list'], ['vs_zo','line-list']
+  ];
+  for (let dm=0; dm<4; dm++) for (let bi=2; bi<=5; bi++) {
+    rPipesExt[`${dm}_${bi}`] = mkRPblend(_dmDefs[dm][0], _dmDefs[dm][1], bi);
+  }
+  pPipe = device.createRenderPipeline({layout:'auto',
+    vertex:{module:pMod,entryPoint:'vs'},
+    fragment:{module:pMod,entryPoint:'fs',targets:[{format}]},
+    primitive:{topology:'triangle-list'}});
+}
+
+function buildBuffers() {
+  if (posBuf)     posBuf.destroy();
+  if (cpuBitsBuf) cpuBitsBuf.destroy();
+  if (gradBuf)    gradBuf.destroy();
+  posBuf     = device.createBuffer({size:MAX_CH*MAX_PTS*16, usage:GPUBufferUsage.STORAGE});
+  cpuBitsBuf = device.createBuffer({size:MAX_CH*Math.ceil(MAX_PTS/32)*4, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  cpuBitsArr = new Uint32Array(8*Math.ceil(MAX_PTS/32));
+  gradBuf    = device.createBuffer({size:FIELD_RES*FIELD_RES*8, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC}); // vec2f per cell
+  if (gradReadBuf) gradReadBuf.destroy();
+  gradReadBuf = device.createBuffer({size:FIELD_RES*FIELD_RES*8, usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+}
+
+function buildBindGroups() {
+  cBG        = device.createBindGroup({layout:cPipe.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:uniBuf}},{binding:1,resource:{buffer:posBuf}},{binding:2,resource:{buffer:cpuBitsBuf}},{binding:3,resource:{buffer:gradBuf}}]});
+  const rendEntries = p => [{binding:0,resource:{buffer:uniBuf}},{binding:1,resource:{buffer:posBuf}}].map(e=>({...e}));
+  const mkBG = pipe => device.createBindGroup({layout:pipe.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:uniBuf}},{binding:1,resource:{buffer:posBuf}}]});
+  rBGL_Alpha    = mkBG(rPipeL_Alpha);
+  rBGL_Add      = mkBG(rPipeL_Add);
+  rBGP_Alpha    = mkBG(rPipeP_Alpha);
+  rBGP_Add      = mkBG(rPipeP_Add);
+  rBGPlus_Alpha = mkBG(rPipePlus_Alpha);
+  rBGPlus_Add   = mkBG(rPipePlus_Add);
+  rBGZO_Alpha   = mkBG(rPipeZO_Alpha);
+  rBGZO_Add     = mkBG(rPipeZO_Add);
+  rBGsExt = {};
+  for (const key of Object.keys(rPipesExt)) rBGsExt[key] = mkBG(rPipesExt[key]);
+}
+
+function buildFieldBindGroup() {
+  fGradBG = device.createBindGroup({layout:fGradPipe.getBindGroupLayout(0),
+    entries:[{binding:0,resource:accView},{binding:1,resource:{buffer:gradBuf}}]});
+}
+
+function reinitGPU(newMaxPts) {
+  if (newMaxPts === MAX_PTS && GPU_INITIALIZED) return;
+  MAX_PTS = newMaxPts;
+  ecs.nodes.filter(n=>n.type==='tpx').forEach(n => clampWords(n));
+  buildShaderPipelines();
+  buildBuffers();
+  buildBindGroups();
+  recreateAcc();
+  buildFieldBindGroup(); // needs accView + gradBuf, both ready here
+  updatePres();
+  GPU_INITIALIZED = true;
+  syncECS(true);
+  renderUI(true);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// UNIFORMS
+// ══════════════════════════════════════════════════════════════════════
+function updateUniforms(baseWord) {
+  uArr[0]=state.panX; uArr[1]=state.panY; uArr[2]=state.zoom; uArr[3]=canvas.width/canvas.height;
+  uArr[4]=state.bgMode; uArr[5]=0; uArr[6]=0; uArr[7]=baseWord;
+  uArr[8]=state.bgCol[0]; uArr[9]=state.bgCol[1]; uArr[10]=state.bgCol[2]; uArr[11]=state.sceneRot*Math.PI/180;
+  uArr[12]=state.fieldStr||0; // g4.x — gradient field strength
+  uArr[13]=state.gravMode||0; // g4.y — tryb grawitacji (0=global, 1=local)
+  for (let i=0;i<MAX_CH;i++) {
+    const g=engine.gravs[i];
+    uArr[16+i*4]=g.x||0; uArr[17+i*4]=g.y||0; uArr[18+i*4]=g.active?1:0; uArr[19+i*4]=g.str||0;
+  }
+  const lmOff = (4 + MAX_CH) * 4;
+  for (let i=0;i<MAX_CH*2;i++) {
+    const l=engine.limits[i], o=lmOff+i*8;
+    uArr[o+0]=l.active?l.shape:0; uArr[o+1]=l.type||0; uArr[o+2]=l.limitA||0; uArr[o+3]=l.limitB||0;
+    uArr[o+4]=l.x||0; uArr[o+5]=l.y||0;
+  }
+  const trOff = (4 + MAX_CH * 5) * 4; // float start of tr[] (after g1-g4, gr[N], lm[2N])
+  const R_VECS = Math.ceil(MAX_CH / 4);
+  const TRK = (9 + R_VECS) * 4; // dynamiczny rozmiar Trk w floatach
+  for (let i=0;i<MAX_CH;i++) {
+    const e=engine.emitters[i], o=trOff+i*TRK;
+    uArr[o+0]=(e.angle||0)*(Math.PI/180); uArr[o+1]=e.stepLen||0; uArr[o+2]=e.steps||0; uArr[o+3]=e.active?e.words:0;
+    uArr[o+4]=e.twist?1:0; uArr[o+5]=e.resetH?1:0; uArr[o+6]=e.pulsar?1:0;
+    uArr[o+8]=e.bits||0; uArr[o+9]=e.seed||0; uArr[o+10]=e.colMode||0; uArr[o+11]=e.alpha||0.5;
+    uArr[o+14]=e.x||0; uArr[o+15]=e.y||0;
+    if(e.palC){uArr[o+16]=e.palC[0];uArr[o+17]=e.palC[1];uArr[o+18]=e.palC[2];}
+    if(e.palD){uArr[o+20]=e.palD[0];uArr[o+21]=e.palD[1];uArr[o+22]=e.palD[2];}
+    if(e.h0){uArr[o+24]=e.h0[0];uArr[o+25]=e.h0[1];uArr[o+26]=e.h0[2];} uArr[o+27]=(e.head||0)*(Math.PI/180);
+    if(e.h1){uArr[o+28]=e.h1[0];uArr[o+29]=e.h1[1];uArr[o+30]=e.h1[2];} uArr[o+31]=e.lod||1;
+    if(e.h2){uArr[o+32]=e.h2[0];uArr[o+33]=e.h2[1];uArr[o+34]=e.h2[2];}
+    // dynamiczne relacje dla wszystkich slotów grawitacyjnych
+    const rf = e.relFloats || [];
+    for(let j=0; j < MAX_CH; j++) { 
+        uArr[o + 36 + j] = rf[j] || 0; 
+    }
+  }
+  pArr[0]=state.bgMode; pArr[1]=state.panX; pArr[2]=state.panY; pArr[3]=state.zoom;
+  pArr[4]=state.bgCol[0]; pArr[5]=state.bgCol[1]; pArr[6]=state.bgCol[2];
+  pArr[8]=canvas.width/canvas.height; pArr[9]=state.mirror;
+  device.queue.writeBuffer(uniBuf,0,uArr);
+  device.queue.writeBuffer(presUniBuf,0,pArr);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// DYSKIETKA — plugin system
+// ══════════════════════════════════════════════════════════════════════
+const _loopHooks       = new Set(); // fn(dtMs) — wywoływane każdą klatką
+const _keyHandlers     = new Set(); // fn(e) → bool — true = pochłania event
+const _contextHandlers = new Map(); // type → fn(ctx, push) — custom buildList
+
+let _loadedMod        = null; // aktualnie załadowana dyskietka
+let _loadedMainCtxType = null; // główny typ kontekstu dyskietki
+
+async function loadDiskette() {
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type  = 'file';
+    input.accept = '.tpxmod,.js';
+    input.onchange = async e => {
+      const file = e.target.files[0];
+      if (!file) { resolve(false); return; }
+      const text = await file.text();
+      const blob = new Blob([text], { type: 'application/javascript' });
+      const url  = URL.createObjectURL(blob);
+      try {
+        const mod = await import(url);
+        if (!mod.MANIFEST || !mod.init) {
+          alert('Nieprawidłowa dyskietka: brak MANIFEST lub init()'); resolve(false); return;
+        }
+        // Wyładuj poprzednią
+        if (_loadedMod) {
+          if (_loadedMod.onLoop)  _loopHooks.delete(_loadedMod.onLoop);
+          if (_loadedMod.destroy) _loadedMod.destroy();
+        }
+        // Zarejestruj hooki
+        if (mod.onLoop) _loopHooks.add(mod.onLoop);
+        // Uruchom
+        _loadedMod = mod;
+        const result = await mod.init(window.TLX_API);
+        console.log(`[Dyskietka] "${mod.MANIFEST.name}" załadowana`, result);
+        renderUI();
+        resolve(true);
+      } catch(err) {
+        alert('Błąd dyskietki: ' + err.message);
+        console.error('[Dyskietka]', err);
+        resolve(false);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+    input.click();
+  });
+}
+
+function ejectDiskette() {
+  if (!_loadedMod) return;
+  if (_loadedMod.onLoop)  _loopHooks.delete(_loadedMod.onLoop);
+  if (_loadedMod.destroy) _loadedMod.destroy();
+  _loadedMod = null;
+  _loadedMainCtxType = null;
+  // Wróć do roota jeśli byliśmy w widoku dyskietki
+  while (ecs.ui.stack.length && ecs.ui.stack[ecs.ui.stack.length-1]._fromDiskette) {
+    ecs.ui.stack.pop();
+  }
+  renderUI();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// MAIN LOOP
+// ══════════════════════════════════════════════════════════════════════
+reinitGPU(MAX_PTS); // first init
+snapshot(); // seed historia klatka 1
+renderUI(true);
+
+function loop() {
+  state.stats.frames++;
+  const now = Date.now();
+  if (now - state.stats.lastTime >= 1000) {
+    state.stats.fps = state.stats.frames; state.stats.frames = 0; state.stats.lastTime = now;
+    let pts = 0;
+    for (let i=0;i<MAX_CH;i++) if (engine.emitters[i].active) pts += Math.min(state.computeProgress, engine.emitters[i].words) * engine.emitters[i].steps;
+    state.stats.pts = pts;
+    // Patch currently/warn stats without full re-render
+    const _stackTop = ecs.ui.stack[ecs.ui.stack.length - 1];
+    if (_stackTop?.type !== 'schowane') {
+      const warn    = pts > maxBits() * 0.8;
+      const statRow = hud.querySelector('.stat-currently');
+      if (statRow) {
+        statRow.className = 'row row--stat stat-currently' + (warn ? ' warn' : '');
+        const valEl = statRow.querySelector('.row-val');
+        if (valEl) valEl.textContent = formatPts(pts);
+      }
+    }
+  }
+
+  const ts = performance.now();
+  let dtFrame = ts - state.sim.lastTs;
+  state.sim.lastTs = ts;
+  // Dyskietka — loop hooks
+  if (_loopHooks.size) for (const h of _loopHooks) h(Math.min(dtFrame, 100));
+  dtFrame = Math.min(dtFrame, 100);
+  state.sim.accMs += dtFrame;
+
+  if (state.sim.pairDirty) {
+    if (state.sim.pairDirtyNeedsRecompute) syncECS(true);
+    state.sim.pairDirty = false;
+    state.sim.pairDirtyNeedsRecompute = false;
+  }
+
+  let simChanged = false;
+  while (simLoopActive() && state.sim.accMs >= state.sim.stepMs) {
+    state.sim.accMs -= state.sim.stepMs;
+    state.sim.tick++;
+
+    let moved = false;
+    if (state.sim.amandaEnabled || state.sim.mouseGrav !== 0) {
+      moved = applyAmandaStep(state.sim.stepMs / 1000) || moved;
+    }
+    if (state.sim.entropyEnabled) {
+      moved = applyStateEntropyStep(state.sim.stepMs / 1000, state.sim.stepMs) || moved;
+    }
+
+    if (moved) {
+      simChanged = true;
+      if (state.saveHistory) {
+        const nowMs = performance.now();
+        if (nowMs - state.sim.lastSnapMs >= state.sim.stepMs - 1) {
+          snapshot();
+          state.sim.lastSnapMs = nowMs;
+        }
+      }
+    }
+  }
+
+  if (simChanged) {
+    syncECS(true);
+    renderUI();
+    drawInspect();
+  }
+
+  if (canvas.width !== accTex.width || canvas.height !== accTex.height) { recreateAcc(); updatePres(); state.redrawAll=true; }
+  else if (!pBG) updatePres();
+
+  let maxW = 0;
+  for (let i=0;i<MAX_CH;i++) if (engine.emitters[i].active) maxW = Math.max(maxW, engine.emitters[i].words||0);
+
+  const chunkWords = 2000;
+  let doCompute = false, drawCommands = [];
+
+  if (state.computing) {
+    const wLeft = Math.max(0, Math.min(chunkWords, maxW - state.computeProgress));
+    if (wLeft > 0) {
+      doCompute = true;
+      const bpE = Math.ceil(MAX_PTS/32);
+      for (let i=0;i<MAX_CH;i++) {
+        const e=engine.emitters[i]; if(!e.active||(e.bits!==3&&e.bits!==7)) continue;
+        const wc=Math.min(wLeft,Math.max(0,e.words-state.computeProgress));
+        const u32Used=Math.ceil(Math.min(wc*e.steps,MAX_PTS)/32);
+        cpuBitsArr.fill(0, i*bpE, i*bpE+u32Used);
+      }
+      for (let i=0;i<MAX_CH;i++) {
+        const e=engine.emitters[i]; if(!e.active||(e.bits!==3&&e.bits!==7)||!state.tpxMachines[i]) continue;
+        const tpx=state.tpxMachines[i], wc=Math.min(wLeft,Math.max(0,e.words-state.computeProgress));
+        const off=i*Math.ceil(MAX_PTS/32);
+        for (let w=0;w<wc;w++) for (let s=0;s<e.steps;s++) {
+          const b=tpx.step(), bi=w*e.steps+s, wi=off+Math.floor(bi/32);
+          if(b) cpuBitsArr[wi] |= (1<<(bi%32));
+        }
+      }
+      device.queue.writeBuffer(cpuBitsBuf,0,cpuBitsArr);
+      for (let i=0;i<MAX_CH;i++) {
+        const e=engine.emitters[i]; if(!e.active) continue;
+        const wc=Math.min(wLeft,Math.max(0,e.words-state.computeProgress)); if(wc<=0) continue;
+        const stride=Math.max(1,e.lod||1), isLines=(e.drawMode===0);
+        let firstV=0, countV=0;
+        if(isLines){if(e.lod>=10){firstV=state.computeProgress*2;countV=wc*2;}else{const sb=Math.floor(state.computeProgress*Math.max(0,e.steps-1)/stride),sa=Math.floor((state.computeProgress+wc)*Math.max(0,e.steps-1)/stride);firstV=sb*2;countV=(sa-sb)*2;}}
+        else{if(e.lod>=10){firstV=state.computeProgress;countV=wc;}else{const pb=Math.floor(state.computeProgress*e.steps/stride),pa=Math.floor((state.computeProgress+wc)*e.steps/stride);firstV=pb;countV=pa-pb;}}
+        const vMul=(e.drawMode===2)?4:(e.drawMode===3)?16:1;
+        if(countV>0) drawCommands.push({i,drawMode:e.drawMode,firstV:isLines?firstV:firstV*vMul,countV:isLines?countV:countV*vMul,blend:e.blend});
+      }
+    } else { state.computing=false; }
+  } else if (state.redrawAll) {
+    for (let i=0;i<MAX_CH;i++) {
+      const e=engine.emitters[i]; if(!e.active) continue;
+      const wc=Math.min(state.computeProgress,e.words); if(wc<=0) continue;
+      const stride=Math.max(1,e.lod||1), isLines=(e.drawMode===0);
+      let countV=0;
+      if(isLines){if(e.lod>=10)countV=wc*2;else countV=Math.floor(wc*Math.max(0,e.steps-1)/stride)*2;}
+      else{if(e.lod>=10)countV=wc;else countV=Math.floor(wc*e.steps/stride);}
+      const vMul=(e.drawMode===2)?4:(e.drawMode===3)?16:1;
+      if(countV>0) drawCommands.push({i,drawMode:e.drawMode,firstV:0,countV:isLines?countV:countV*vMul,blend:e.blend});
+    }
+    state.redrawAll=false; state.presentDirty=true;
+  }
+
+  const needGPU = doCompute || drawCommands.length>0 || state.accClear;
+  if (needGPU) state.presentDirty=true;
+
+  if (needGPU || state.presentDirty) {
+    const enc = device.createCommandEncoder();
+    if (needGPU) {
+      if (doCompute) {
+        updateUniforms(state.computeProgress);
+        // gradient field pass — reads accTex (previous frame), writes gradBuf
+        if (state.fieldStr > 0 && fGradBG) {
+          const fp=enc.beginComputePass(); fp.setPipeline(fGradPipe); fp.setBindGroup(0,fGradBG);
+          fp.dispatchWorkgroups(FIELD_RES/8, FIELD_RES/8); fp.end();
+          // readback for inspect overlay (async, result available next frame)
+          if (state.showGrid && gradReadBuf && gradReadBuf.mapState === 'unmapped') {
+            enc.copyBufferToBuffer(gradBuf, 0, gradReadBuf, 0, FIELD_RES*FIELD_RES*8);
+          }
+        }
+        const cp=enc.beginComputePass(); cp.setPipeline(cPipe); cp.setBindGroup(0,cBG);
+        const wc=Math.max(0,Math.min(chunkWords,maxW-state.computeProgress));
+        if(wc>0) cp.dispatchWorkgroups(Math.ceil(wc/64),MAX_CH);
+        cp.end();
+      } else if (drawCommands.length>0||state.accClear) { updateUniforms(0); }
+      if (drawCommands.length>0||state.accClear) {
+        const pass=enc.beginRenderPass({colorAttachments:[{view:accView,loadOp:state.accClear?'clear':'load',storeOp:'store',clearValue:{r:0,g:0,b:0,a:0}}]});
+        for (const cmd of drawCommands) {
+          const bi=cmd.blend??0, dm=cmd.drawMode??0;
+          let pipe, bg;
+          if(bi>=2){pipe=rPipesExt[`${dm}_${bi}`];bg=rBGsExt[`${dm}_${bi}`];}
+          else if(dm===0){pipe=bi?rPipeL_Add:rPipeL_Alpha;bg=bi?rBGL_Add:rBGL_Alpha;}
+          else if(dm===1){pipe=bi?rPipeP_Add:rPipeP_Alpha;bg=bi?rBGP_Add:rBGP_Alpha;}
+          else if(dm===2){pipe=bi?rPipePlus_Add:rPipePlus_Alpha;bg=bi?rBGPlus_Add:rBGPlus_Alpha;}
+          else{pipe=bi?rPipeZO_Add:rPipeZO_Alpha;bg=bi?rBGZO_Add:rBGZO_Alpha;}
+          pass.setPipeline(pipe);
+          pass.setBindGroup(0,bg);
+          pass.draw(cmd.countV,1,cmd.firstV,cmd.i);
+        }
+        pass.end(); state.accClear=false;
+      }
+      if (doCompute) { state.computeProgress+=chunkWords; if(state.computeProgress>=maxW) state.computing=false; }
+    }
+    const curTex = context.getCurrentTexture();
+    const pp=enc.beginRenderPass({colorAttachments:[{view:curTex.createView(),loadOp:'clear',storeOp:'store',clearValue:{r:0,g:0,b:0,a:1}}]});
+    
+pp.setPipeline(pPipe); pp.setBindGroup(0,pBG); pp.draw(3); pp.end();
+
+    device.queue.submit([enc.finish()]);
+    state.presentDirty=false;
+
+    // async readback for gradient inspect overlay
+    if (state.showGrid && state.fieldStr > 0 && gradReadBuf && gradReadBuf.mapState === 'unmapped') {
+      gradReadBuf.mapAsync(GPUMapMode.READ).then(() => {
+        gradCpuData = new Float32Array(gradReadBuf.getMappedRange().slice(0));
+        gradReadBuf.unmap();
+        if (state.showGrid) drawInspect();
+      });
+    }
+
+    // Hook dla eksportu on-demand: gdy GPU skończy liczyć i present pass gotowy
+    if (captureResolve && !state.computing) {
+      const res = captureResolve; captureResolve = null;
+      res();
+    }
+  }
+
+  requestAnimationFrame(loop);
+}
+// ══════════════════════════════════════════════════════════════════════
+// TLX_API — publiczny interfejs dla dyskietek
+// ══════════════════════════════════════════════════════════════════════
+window.TLX_API = {
+  // DOM
+  get canvas() { return canvas; },
+  get ov()     { return ov; },
+
+  // Live references (nie kopie)
+  get ecs()      { return ecs; },
+  get state()    { return state; },
+  get engine()   { return engine; },
+  get TLX_PHYS() { return TLX_PHYS; },
+  get lists()    { return lists; },
+  get TLX_REGISTRY() { return TLX_REGISTRY; },
+
+  // Funkcje silnika
+  syncECS,
+  renderUI,
+  snapshot,
+  addNode,
+  deleteNode,
+  genPalColors,
+  setRelationMode,
+  getRelationMode,
+  getRelationStrengthMagnitude,
+  ensureNodeRelations,
+  ensureNodeDyn,
+  clampWords,
+  newId,
+  tlxRegGroup,
+  tlxRegView,
+  sleep: ms => new Promise(r => setTimeout(r, ms)),
+
+  // Hooki
+  registerLoopHook:      fn  => _loopHooks.add(fn),
+  unregisterLoopHook:    fn  => _loopHooks.delete(fn),
+  registerKeyHandler:    fn  => _keyHandlers.add(fn),
+  unregisterKeyHandler:  fn  => _keyHandlers.delete(fn),
+
+  // Context handler — dyskietka rejestruje własne typy ctx
+  // fn(ctx, push) gdzie push(rows[]) dodaje grupę do buildList
+  registerContextHandler(type, fn, mainCtxType) {
+    _contextHandlers.set(type, fn);
+    if (mainCtxType) _loadedMainCtxType = mainCtxType;
+  },
+  unregisterContextHandler: type => _contextHandlers.delete(type),
+};
+
+loop();
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
